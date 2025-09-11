@@ -70,6 +70,7 @@ func (t *Throttle) Do(f func()) {
 type DelayedState struct {
 	StartTime time.Duration
 	Timer     *time.Timer
+	ExecFunc  func()
 }
 
 type DelayedExecutor struct {
@@ -91,13 +92,14 @@ func (d *DelayedExecutor) Do(key string, execFunc func()) {
 
 	wait := d.Delay
 	state := s.(*DelayedState)
+	state.ExecFunc = execFunc
 
 	if loaded && state.StartTime > 0 {
 		elapsed := now - state.StartTime
 		remaining := d.MaxInterval - elapsed
 
 		if remaining <= 0 {
-			d.trigger(key, execFunc)
+			d.trigger(key)
 			return
 		}
 
@@ -111,7 +113,7 @@ func (d *DelayedExecutor) Do(key string, execFunc func()) {
 	} else {
 		state.StartTime = now
 		state.Timer = time.AfterFunc(wait*time.Second, func() {
-			d.trigger(key, execFunc)
+			d.trigger(key)
 		})
 	}
 }
@@ -124,11 +126,11 @@ func (d *DelayedExecutor) Cancel(key string) {
 	}
 }
 
-func (d *DelayedExecutor) trigger(key string, execFunc func()) {
-	_, ok := d.States.LoadAndDelete(key)
+func (d *DelayedExecutor) trigger(key string) {
+	s, ok := d.States.LoadAndDelete(key)
 	if !ok {
 		return
 	}
 
-	execFunc()
+	s.(*DelayedState).ExecFunc()
 }
