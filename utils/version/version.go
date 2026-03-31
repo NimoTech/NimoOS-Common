@@ -13,17 +13,17 @@ import (
 )
 
 const (
-	LegacyCasaOSServiceName = "casaos.service"
+	LegacyNimoOSServiceName = "nimoos.service"
 	configKeyUniqueToZero3x = "USBAutoMount"
 	configKeyDBPath         = "DBPath"
 )
 
 var (
 	// this value will be updated at init() to actual config file path.
-	LegacyCasaOSConfigFilePath = "/etc/casaos.conf"
+	LegacyNimoOSConfigFilePath = "/etc/nimoos.conf"
 
 	_configFile        *ini.File
-	_casaOSBinFilePath string
+	_nimoOSBinFilePath string
 )
 
 var (
@@ -32,7 +32,7 @@ var (
 )
 
 func init() {
-	serviceFilePath := file.FindFirstFile("/etc/systemd", LegacyCasaOSServiceName)
+	serviceFilePath := file.FindFirstFile("/etc/systemd", LegacyNimoOSServiceName)
 	if serviceFilePath == "" {
 		return
 	}
@@ -55,11 +55,11 @@ func init() {
 	execStart := key.Value()
 	texts := strings.Split(execStart, " ")
 
-	// locaste casaos binary.
-	_casaOSBinFilePath = texts[0]
+	// locaste nimoos binary.
+	_nimoOSBinFilePath = texts[0]
 
-	if _, err := os.Stat(_casaOSBinFilePath); os.IsNotExist(err) {
-		_casaOSBinFilePath, err = exec.LookPath("casaos")
+	if _, err := os.Stat(_nimoOSBinFilePath); os.IsNotExist(err) {
+		_nimoOSBinFilePath, err = exec.LookPath("nimoos")
 
 		if err != nil {
 			return
@@ -70,17 +70,17 @@ func init() {
 	if len(texts) > 2 {
 		for i, text := range texts {
 			if text == "-c" {
-				LegacyCasaOSConfigFilePath = texts[i+1]
+				LegacyNimoOSConfigFilePath = texts[i+1]
 				break
 			}
 		}
 	}
 
-	if _, err := os.Stat(LegacyCasaOSConfigFilePath); os.IsNotExist(err) {
+	if _, err := os.Stat(LegacyNimoOSConfigFilePath); os.IsNotExist(err) {
 		return
 	}
 
-	_configFile, _ = ini.Load(LegacyCasaOSConfigFilePath)
+	_configFile, _ = ini.Load(LegacyNimoOSConfigFilePath)
 }
 
 func DetectLegacyVersion() (int, int, int, error) {
@@ -114,7 +114,7 @@ func DetectLegacyVersion() (int, int, int, error) {
 }
 
 func DetectVersion() (int, int, int, error) {
-	cmd := exec.Command(_casaOSBinFilePath, "-v")
+	cmd := exec.Command(_nimoOSBinFilePath, "-v")
 	versionBytes, err := cmd.Output()
 	if err != nil {
 		return -1, -1, -1, ErrVersionNotFound
@@ -128,9 +128,9 @@ func DetectVersion() (int, int, int, error) {
 	return major, minor, patch, nil
 }
 
-// Detect minor version of CasaOS. It returns 2 for "0.2.x" or 3 for "0.3.x"
+// Detect minor version of NimoOS. It returns 2 for "0.2.x" or 3 for "0.3.x"
 //
-// (This is often useful when failing to get version from API because CasaOS is not running.)
+// (This is often useful when failing to get version from API because NimoOS is not running.)
 func DetectMinorVersion() (int, error) {
 	if _configFile == nil {
 		return -1, ErrLegacyVersionNotFound

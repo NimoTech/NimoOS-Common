@@ -1,6 +1,6 @@
-# CasaOS-Common 详解
+# NimoOS-Common 详解
 
-CasaOS-Common 是所有 CasaOS 微服务共用的基础库，提供日志、JWT、HTTP 工具、文件操作、系统管理、服务间通信等核心能力。
+NimoOS-Common 是所有 NimoOS 微服务共用的基础库，提供日志、JWT、HTTP 工具、文件操作、系统管理、服务间通信等核心能力。
 
 ---
 
@@ -22,7 +22,7 @@ CasaOS-Common 是所有 CasaOS 微服务共用的基础库，提供日志、JWT�
 ## 目录结构
 
 ```
-CasaOS-Common/
+NimoOS-Common/
 ├── model/                   # 共享数据模型
 │   ├── sys_common.go        # Result 标准响应结构
 │   ├── device.go            # DeviceInfo（网络、硬件）
@@ -67,7 +67,7 @@ CasaOS-Common/
 - 自动注入调用者信息（函数名、文件、行号）
 
 ```go
-logger.LogInit("/var/log/casaos", "casaos", "log")
+logger.LogInit("/var/log/nimoos", "nimoos", "log")
 logger.Info("Service started", zap.String("service", "app"))
 ```
 
@@ -152,7 +152,7 @@ systemctl.EnableService(nameOrPath, wait)
 ParseVersion("v0.4.3-beta") // → major=0, minor=4, patch=3
 Compare(v1, v2 string) int  // -1, 0, 1
 
-// 迁移状态追踪（存储于 /var/lib/casaos/migration/）
+// 迁移状态追踪（存储于 /var/lib/nimoos/migration/）
 GetGlobalMigrationStatus(serviceName)
 status.Done(version)
 ```
@@ -161,13 +161,13 @@ status.Done(version)
 
 ## 外部服务客户端（external）
 
-各服务通过读取 `/var/run/casaos/*.url` 文件发现其他服务地址：
+各服务通过读取 `/var/run/nimoos/*.url` 文件发现其他服务地址：
 
 | 客户端 | 功能 | 地址文件 |
 |---|---|---|
 | `GetPublicKey(runtimePath)` | 获取 UserService JWT 公钥 | `user-service.url` |
 | `NewManagementService(path)` | Gateway 路由注册/端口管理 | `management.url` |
-| `NewNotifyService(path)` | 发送系统通知 | `casaos.url` |
+| `NewNotifyService(path)` | 发送系统通知 | `nimoos.url` |
 | `NewAppManageService(path)` | 查询/更新 App 状态 | `app-management.url` |
 | `PublishEventInSocket(...)` | 通过 Unix socket 发布事件到 MessageBus | `message-bus.sock` |
 
@@ -203,11 +203,11 @@ type Result struct {
 ## 系统标准路径
 
 ```go
-DefaultConfigPath   = "/etc/casaos"
-DefaultDataPath     = "/var/lib/casaos"
-DefaultLogPath      = "/var/log/casaos"
-DefaultRuntimePath  = "/var/run/casaos"
-DefaultConstantPath = "/usr/share/casaos"
+DefaultConfigPath   = "/etc/nimoos"
+DefaultDataPath     = "/var/lib/nimoos"
+DefaultLogPath      = "/var/log/nimoos"
+DefaultRuntimePath  = "/var/run/nimoos"
+DefaultConstantPath = "/usr/share/nimoos"
 ```
 
 ---

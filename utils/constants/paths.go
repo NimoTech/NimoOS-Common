@@ -1,10 +1,10 @@
 package constants
 
 const (
-	DefaultConfigPath   = "/etc/casaos"
-	DefaultConstantPath = "/usr/share/casaos"
-	DefaultDataPath     = "/var/lib/casaos"
-	DefaultFilePath     = "/var/lib/casaos/files"
-	DefaultLogPath      = "/var/log/casaos"
-	DefaultRuntimePath  = "/var/run/casaos"
+	DefaultConfigPath   = "/etc/nimoos"
+	DefaultConstantPath = "/usr/share/nimoos"
+	DefaultDataPath     = "/var/lib/nimoos"
+	DefaultFilePath     = "/var/lib/nimoos/files"
+	DefaultLogPath      = "/var/log/nimoos"
+	DefaultRuntimePath  = "/var/run/nimoos"
 )

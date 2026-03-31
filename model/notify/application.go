@@ -2,9 +2,9 @@
  *@Date: 2022-05-27 15:01:58
  *@LastEditors: LinkLeong
  *@LastEditTime: 2022-05-31 14:51:21
- *@FilePath: /CasaOS/model/notify/application.go
+ *@FilePath: /NimoOS/model/notify/application.go
  *@Description:
- *@Website: https://www.casaos.io
+ *@Website: https://www.nimoos.io
  *Copyright (c) 2022 by icewhale, All Rights Reserved.
  */
 package notify
