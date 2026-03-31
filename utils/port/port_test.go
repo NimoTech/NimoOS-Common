@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/IceWhaleTech/CasaOS-Common/utils/port"
+	"github.com/NimoTech/NimoOS-Common/utils/port"
 	"github.com/stretchr/testify/assert"
 )
 

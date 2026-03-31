@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	http2 "github.com/IceWhaleTech/CasaOS-Common/utils/http"
+	http2 "github.com/NimoTech/NimoOS-Common/utils/http"
 )
 
 const (

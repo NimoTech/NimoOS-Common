@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/IceWhaleTech/CasaOS-Common/model"
-	http2 "github.com/IceWhaleTech/CasaOS-Common/utils/http"
+	"github.com/NimoTech/NimoOS-Common/model"
+	http2 "github.com/NimoTech/NimoOS-Common/utils/http"
 )
 
 const (

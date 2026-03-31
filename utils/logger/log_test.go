@@ -3,7 +3,7 @@ package logger_test
 import (
 	"testing"
 
-	"github.com/IceWhaleTech/CasaOS-Common/utils/logger"
+	"github.com/NimoTech/NimoOS-Common/utils/logger"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap/zapcore"
 )

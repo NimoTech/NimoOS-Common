@@ -7,9 +7,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/IceWhaleTech/CasaOS-Common/model"
-	"github.com/IceWhaleTech/CasaOS-Common/utils/common_err"
-	"github.com/IceWhaleTech/CasaOS-Common/utils/jwt"
+	"github.com/NimoTech/NimoOS-Common/model"
+	"github.com/NimoTech/NimoOS-Common/utils/common_err"
+	"github.com/NimoTech/NimoOS-Common/utils/jwt"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
