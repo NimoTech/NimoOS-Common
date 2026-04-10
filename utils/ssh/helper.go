@@ -151,7 +151,7 @@ func ReceiveWsMsgUser(wsConn *websocket.Conn, logBuff *bytes.Buffer) string {
 	}
 }
 
-func ReceiveWsMsgPassword(wsConn *websocket.Conn, logBuff *bytes.Buffer) string {
+func ReceiveWsMsgPassword(wsConn *websocket.Conn, logBuff *bytes.Buffer, attemptCount *int) string {
 	// tells other go routine quit
 	password := ""
 	for {
@@ -172,23 +172,34 @@ func ReceiveWsMsgPassword(wsConn *websocket.Conn, logBuff *bytes.Buffer) string 
 		//	logrus.WithError(err).WithField("wsData", string(wsData)).Error("unmarshal websocket message failed")
 		//}
 		switch msgObj.Type {
+		case wsMsgResize:
+			// Explicitly skip window resize JSON messages during password collection
+			continue
 		case wsMsgCmd:
-			// handle xterm.js stdin
-			// decodeBytes, err := base64.StdEncoding.DecodeString(msgObj.Cmd)
-			if msgObj.Cmd == "\r" {
+			cmd := msgObj.Cmd
+			// Map \r\n, \r, or \n to a single password submission
+			if cmd == "\r" || cmd == "\n" || cmd == "\r\n" {
+				if password == "" && *attemptCount == 0 {
+					// Some xterm-addon-attach versions send an initial empty cmd
+					// during handshake, skip it once if empty.
+					*attemptCount++
+					continue
+				}
 				return password
 			}
 
-			if msgObj.Cmd == "\u007f" {
-				if len(password) == 0 {
-					continue
+			// Handle backspace
+			if cmd == "\u007f" || cmd == "\b" {
+				if len(password) > 0 {
+					password = password[:len(password)-1]
 				}
-				password = password[:len(password)-1]
 				continue
 			}
-			password += msgObj.Cmd
-		}
 
+			// Typical character input
+			password += cmd
+			*attemptCount++
+		}
 	}
 }
 
