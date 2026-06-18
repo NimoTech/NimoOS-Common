@@ -1,5 +1,7 @@
 package upload
 
+import "errors"
+
 // Store 是上传任务的持久化接口。各服务自行实现(GORM/原生 SQL 均可),
 // 通用内核(Cancel/SweepTasks/StartGC)只依赖此接口,不依赖任何具体驱动。
 type Store interface {
@@ -26,7 +28,7 @@ type Store interface {
 //   - 其余状态(uploading/paused/failed) → 置 canceled、更新 expiresAt → 返回 (true, nil)。
 func Cancel(s Store, id string, expiresAt int64) (bool, error) {
 	t, err := s.Get(id)
-	if err == ErrNotFound {
+	if errors.Is(err, ErrNotFound) {
 		return false, nil
 	}
 	if err != nil {

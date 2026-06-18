@@ -46,9 +46,7 @@ func TestSweepTasksTieredCleanup(t *testing.T) {
 
 	cfg := GCConfig{
 		StagingDir:     dir,
-		IdleTimeout:    DefaultIdleTimeoutSeconds,
 		PausedTTL:      DefaultPausedTTLSeconds,
-		CanceledTTL:    DefaultCanceledTTLSeconds,
 		GCIntervalSecs: DefaultGCIntervalSeconds,
 	}
 
@@ -128,7 +126,6 @@ func TestSweepTasksFailedAndPausedDeleted(t *testing.T) {
 	cfg := GCConfig{
 		StagingDir:     dir,
 		PausedTTL:      DefaultPausedTTLSeconds,
-		CanceledTTL:    DefaultCanceledTTLSeconds,
 		GCIntervalSecs: DefaultGCIntervalSeconds,
 	}
 

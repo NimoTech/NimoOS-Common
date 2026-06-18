@@ -7,11 +7,10 @@ const (
 	DefaultGCIntervalSeconds  = int64(60 * 60)
 )
 
-// GCConfig 由各服务注入(尤其 StagingDir 各不相同)。
+// GCConfig 仅含 SweepTasks 实际使用的字段;写侧 TTL(idle/canceled)由调用方用
+// Default*Seconds 常量在 NewTask/Cancel/SetStatus 时传入。
 type GCConfig struct {
 	StagingDir     string
-	IdleTimeout    int64
 	PausedTTL      int64
-	CanceledTTL    int64
 	GCIntervalSecs int64
 }
