@@ -87,16 +87,35 @@ func ApplyApConfig(iface string, config model.WirelessConfig) error {
 		return err
 	}
 
-	// For concurrent mode, set up the virtual AP interface with IP
+	// For concurrent mode, wait for wpa_supplicant to connect, then create
+	// the virtual AP interface. Intel WiFi drivers reject client STA authentication
+	// when a virtual AP exists on the same phy, so we must defer vAP creation.
 	if config.Mode == "concurrent" {
+		// Poll iw link up to 15s for client to connect
+		for i := 0; i < 15; i++ {
+			out, _ := exec.Command("iw", "dev", iface, "link").Output()
+			if strings.Contains(string(out), "Connected to") {
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		cleanupVirtualIfaces(iface)
+		if err := createVirtualAP(iface, hostapdIface); err != nil {
+			return fmt.Errorf("failed to create virtual AP interface: %w", err)
+		}
 		_ = exec.Command("ip", "addr", "add", "192.168.22.1/24", "dev", hostapdIface).Run()
 		_ = exec.Command("ip", "link", "set", hostapdIface, "up").Run()
 	}
 
-	// Restart hostapd
-	cmd := exec.Command("systemctl", "restart", "hostapd")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to restart hostapd: %w", err)
+	// Reload or restart hostapd
+	// Use reload when possible (avoids disrupting the client connection in concurrent mode).
+	// `hostapd_cli reload` sends SIGHUP to re-read config without full restart.
+	if err := exec.Command("hostapd_cli", "reload").Run(); err != nil {
+		// Fallback to full restart if reload fails (e.g. hostapd not yet running)
+		cmd := exec.Command("systemctl", "restart", "hostapd")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to restart hostapd: %w", err)
+		}
 	}
 
 	// Start channel watchdog for concurrent mode
@@ -146,8 +165,8 @@ func runWatchdog(clientIface, apIface string) {
 		newContent := updateChannelInHostapd(string(content), channel)
 		_ = os.WriteFile(hostapdConfPath, []byte(newContent), 0644)
 
-		// 3. Hot restart AP
-		_ = exec.Command("systemctl", "restart", "hostapd").Run()
+		// 3. Hot restart AP (reload to avoid disrupting client connection)
+		_ = exec.Command("hostapd_cli", "reload").Run()
 	}
 }
 

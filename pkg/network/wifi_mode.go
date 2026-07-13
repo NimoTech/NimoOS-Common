@@ -57,15 +57,17 @@ func setClientMode(ifaceName, ssid, password string) error {
 	}
 	_ = exec.Command("ip", "link", "set", ifaceName, "up").Run()
 
-	// 5. Generate wpa_supplicant.conf and restart
+	// 5. Stop wpa_supplicant for this interface (always — clears any existing connection)
+	stopWpaSupplicantForIface(ifaceName)
+
+	// 6. Generate wpa_supplicant.conf and restart (only when connecting to a network)
 	if ssid != "" {
 		if err := generateAndStartWpaSupplicant(ifaceName, ssid, password); err != nil {
 			return fmt.Errorf("failed to configure wpa_supplicant: %w", err)
 		}
+		// 7. Run dhcpcd in background to get IP once wpa_supplicant connects.
+		_ = exec.Command("dhcpcd", ifaceName).Start()
 	}
-
-	// 6. Run dhcpcd in background to get IP once wpa_supplicant connects.
-	_ = exec.Command("dhcpcd", ifaceName).Start()
 
 	return nil
 }
@@ -118,19 +120,26 @@ func setConcurrentMode(ifaceName, ssid, password, apSsid, apPassword string, cha
 	}
 	_ = exec.Command("ip", "link", "set", ifaceName, "up").Run()
 
-	// 3. Clean up stale virtual interfaces and create new virtual AP interface
+	// 4. Clean up any stale virtual AP interfaces (from previous runs)
 	cleanupVirtualIfaces(ifaceName)
 
-	apIface := virtualApName(ifaceName)
-	if err := createVirtualAP(ifaceName, apIface); err != nil {
-		return fmt.Errorf("failed to create virtual AP interface: %w", err)
-	}
+	// 5. Stop wpa_supplicant (ensures clean state before restart)
+	stopWpaSupplicantForIface(ifaceName)
 
-	// 4. Configure wpa_supplicant for client connection on main interface
+	// 6. Flush any stale IP (e.g. 192.168.22.1 from previous AP mode) so dhcpcd
+	// can obtain a fresh address after wpa_supplicant connects.
+	_ = exec.Command("ip", "addr", "flush", "dev", ifaceName).Run()
+
+	// 7. Configure wpa_supplicant for client connection on main interface.
+	// Note: virtual AP interface is NOT created here — Intel WiFi drivers reject
+	// STA auth when a virtual AP interface exists on the same phy.
+	// The vAP interface will be created by ApplyApConfig after client connects.
 	if ssid != "" {
 		if err := generateAndStartWpaSupplicant(ifaceName, ssid, password); err != nil {
 			return fmt.Errorf("failed to configure wpa_supplicant for concurrent: %w", err)
 		}
+		// 8. Start dhcpcd to obtain IP once wpa_supplicant connects.
+		_ = exec.Command("dhcpcd", ifaceName).Start()
 	}
 
 	// Hostapd conf and restart will be handled by ApplyApConfig (called by the route handler).

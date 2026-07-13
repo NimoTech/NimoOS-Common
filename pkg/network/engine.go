@@ -452,6 +452,10 @@ func WriteInterfaceConfig(iface model.NetworkInterface) error {
 		if iface.Wireless.SSID == "" && iface.Wireless.Mode != "client" && iface.Wireless.Mode != "concurrent" {
 			uc.Client = nil
 		}
+		// Clear client config when SSID is explicitly empty in client/concurrent mode (disconnect)
+		if iface.Wireless.SSID == "" && (iface.Wireless.Mode == "client" || iface.Wireless.Mode == "concurrent") {
+			uc.Client = nil
+		}
 		// Only overwrite hotspot config when ApSsid is explicitly provided
 		if iface.Wireless.ApSsid != "" {
 			password := iface.Wireless.ApPassword
@@ -472,6 +476,11 @@ func WriteInterfaceConfig(iface model.NetworkInterface) error {
 	// Only overwrite IPv4 config when explicitly provided
 	if iface.IPv4 != nil {
 		uc.IPv4 = iface.IPv4
+	} else if iface.Wireless != nil && iface.Wireless.Mode == "client" && uc.IPv4 != nil && uc.IPv4.Method == "static" {
+		// Switching from AP/client mode without explicit IPv4 config.
+		// AP mode forces static IP (192.168.22.1), which is not appropriate
+		// for client mode — reset to DHCP.
+		uc.IPv4 = &model.IPv4Config{Method: "dhcp"}
 	}
 
 	// 2. Save to unified config
