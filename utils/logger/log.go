@@ -41,6 +41,10 @@ func LogInitWithWriterSyncers(syncers ...zapcore.WriteSyncer) {
 				})...,
 		),
 	)
+
+	// 让 zap.L()/zap.S() 指向同一个已初始化 logger：下游服务（Photos 等）
+	// 大量使用 zap.L()，不 Replace 的话那些日志全部打进 zap 默认的 no-op logger 被静默丢弃。
+	zap.ReplaceGlobals(loggers)
 }
 
 // for unit tests

@@ -15,3 +15,6 @@
 # vendor/
 
 .vscode/
+
+# Claude Code local guidance — not for upload
+CLAUDE.md
