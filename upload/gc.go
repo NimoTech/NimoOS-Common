@@ -25,6 +25,11 @@ func SweepTasks(s Store, cfg GCConfig, now time.Time) (transitioned, deleted int
 	if e != nil {
 		return 0, 0, e
 	}
+	// 目录列表每轮解析一次(枚举有真实 IO,与 batch_sweeper 的每轮一次语义对齐)。
+	dirs := []string{cfg.StagingDir}
+	if cfg.StagingDirs != nil {
+		dirs = cfg.StagingDirs()
+	}
 	for _, t := range due {
 		switch t.Status {
 		case UploadStatusUploading:
@@ -33,7 +38,9 @@ func SweepTasks(s Store, cfg GCConfig, now time.Time) (transitioned, deleted int
 			}
 			transitioned++
 		case UploadStatusPaused, UploadStatusFailed, UploadStatusCanceled:
-			removeStaging(cfg.StagingDir, t.ID)
+			for _, d := range dirs {
+				removeStaging(d, t.ID)
+			}
 			if e := s.Delete(t.ID); e != nil {
 				return transitioned, deleted, e
 			}
