@@ -33,7 +33,13 @@ func SweepTasks(s Store, cfg GCConfig, now time.Time) (transitioned, deleted int
 			}
 			transitioned++
 		case UploadStatusPaused, UploadStatusFailed, UploadStatusCanceled:
-			removeStaging(cfg.StagingDir, t.ID)
+			dirs := []string{cfg.StagingDir}
+			if cfg.StagingDirs != nil {
+				dirs = cfg.StagingDirs()
+			}
+			for _, d := range dirs {
+				removeStaging(d, t.ID)
+			}
 			if e := s.Delete(t.ID); e != nil {
 				return transitioned, deleted, e
 			}

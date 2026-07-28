@@ -147,3 +147,89 @@ func TestSweepTasksFailedAndPausedDeleted(t *testing.T) {
 		}
 	}
 }
+
+// TestSweepTasksRemovesStagingFromAllDirs 验证 StagingDirs 非 nil 时,GC 会对每个
+// 返回的目录都尝试 removeStaging——覆盖 per-volume 暂存路由后残片不在 StagingDir
+// 的场景(dirA 为空,残片实际落在 dirB)。
+func TestSweepTasksRemovesStagingFromAllDirs(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	now := time.Unix(3_000_000, 0)
+	past := now.Unix() - 1
+
+	taskID := "t1"
+	// dirA(cfg.StagingDir)不放文件;dirB 放 t1 与 t1.info
+	if err := os.WriteFile(filepath.Join(dirB, taskID), []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dirB, taskID+".info"), []byte("info"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newFakeStore()
+	_ = s.Create(&UploadTask{ID: taskID, Status: UploadStatusPaused, ExpiresAt: past})
+
+	cfg := GCConfig{
+		StagingDir: dirA,
+		StagingDirs: func() []string {
+			return []string{dirA, dirB}
+		},
+		PausedTTL:      DefaultPausedTTLSeconds,
+		GCIntervalSecs: DefaultGCIntervalSeconds,
+	}
+
+	_, deleted, err := SweepTasks(s, cfg, now)
+	if err != nil {
+		t.Fatalf("SweepTasks error: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("expected deleted=1, got %d", deleted)
+	}
+
+	if _, err := os.Stat(filepath.Join(dirB, taskID)); !os.IsNotExist(err) {
+		t.Error("expected dirB staging file to be removed")
+	}
+	if _, err := os.Stat(filepath.Join(dirB, taskID+".info")); !os.IsNotExist(err) {
+		t.Error("expected dirB staging .info file to be removed")
+	}
+	if _, err := s.Get(taskID); err != ErrNotFound {
+		t.Error("expected task to be deleted from store")
+	}
+}
+
+// TestSweepTasksNilStagingDirsFallsBack 验证 StagingDirs 为 nil 时,退化为仅清
+// cfg.StagingDir(旧行为),保持向后兼容。
+func TestSweepTasksNilStagingDirsFallsBack(t *testing.T) {
+	dirA := t.TempDir()
+	now := time.Unix(4_000_000, 0)
+	past := now.Unix() - 1
+
+	taskID := "t1"
+	if err := os.WriteFile(filepath.Join(dirA, taskID), []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newFakeStore()
+	_ = s.Create(&UploadTask{ID: taskID, Status: UploadStatusPaused, ExpiresAt: past})
+
+	cfg := GCConfig{
+		StagingDir:     dirA,
+		StagingDirs:    nil,
+		PausedTTL:      DefaultPausedTTLSeconds,
+		GCIntervalSecs: DefaultGCIntervalSeconds,
+	}
+
+	_, deleted, err := SweepTasks(s, cfg, now)
+	if err != nil {
+		t.Fatalf("SweepTasks error: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("expected deleted=1, got %d", deleted)
+	}
+	if _, err := os.Stat(filepath.Join(dirA, taskID)); !os.IsNotExist(err) {
+		t.Error("expected dirA staging file to be removed")
+	}
+	if _, err := s.Get(taskID); err != ErrNotFound {
+		t.Error("expected task to be deleted from store")
+	}
+}
