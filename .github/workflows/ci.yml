@@ -1,0 +1,59 @@
+name: CI
+
+# Build, vet and test on every pull request, and on main so a bad merge shows up
+# immediately rather than surprising the next person to open a PR.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Read-only: nothing here publishes anything. A token that cannot write is one
+# that cannot be misused by a compromised dependency.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out NimoOS-Common
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: NimoOS-Common
+
+      # Take the toolchain from go.mod so this workflow cannot drift from what
+      # the module actually declares.
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: NimoOS-Common/go.mod
+          cache-dependency-path: NimoOS-Common/go.sum
+
+      # Pure Go, matching NimoOS-Build/scripts/deploy.sh.
+      - name: Build
+        working-directory: NimoOS-Common
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      - name: Vet
+        working-directory: NimoOS-Common
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      # Everything skipped below is skipped for a stated reason, so that a
+      # red run always means something is genuinely broken.
+      #
+      # mod_management's tests are integration tests: they read
+      # /var/run/nimoos/management.url and call a running management
+      # service, so they can only pass on an installed NimoOS.
+      - name: Test
+        working-directory: NimoOS-Common
+        env:
+          CGO_ENABLED: "0"
+        run: go test $(go list ./... | grep -v -E '/pkg/mod_management')
