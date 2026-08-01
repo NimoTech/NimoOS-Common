@@ -370,7 +370,7 @@ type wsMsg struct {
 	Rows int    `json:"rows"`
 }
 
-// 将终端的输出转发到前端
+// WsWriterCopy forwards the terminal's output to the frontend
 func WsWriterCopy(reader io.Reader, writer *websocket.Conn) {
 	buf := make([]byte, 8192)
 	reg1 := regexp.MustCompile(`stty rows \d+ && stty cols \d+ `)
@@ -394,7 +394,7 @@ func WsWriterCopy(reader io.Reader, writer *websocket.Conn) {
 	}
 }
 
-// 将前端的输入转发到终端
+// WsReaderCopy forwards the frontend's input to the terminal
 func WsReaderCopy(reader *websocket.Conn, writer io.Writer) {
 	for {
 		messageType, p, err := reader.ReadMessage()

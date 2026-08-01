@@ -1,6 +1,7 @@
-// Package upload 是可恢复上传引擎的通用内核:模型、状态机、分级 GC、Store 接口。
-// 本包不依赖 gorm/tusd/echo —— gorm tag 仅为纯 struct tag 字符串,供使用方的 GORM
-// 层读取;原生 SQL 使用方忽略 tag、按字段名自行映射。
+// Package upload is the common kernel for the resumable upload engine: model, state
+// machine, tiered GC, and Store interface. This package does not depend on
+// gorm/tusd/echo — the gorm tags are plain struct tag strings for the caller's GORM
+// layer to read; raw-SQL callers ignore the tags and map fields by name themselves.
 package upload
 
 import "errors"
@@ -13,10 +14,11 @@ const (
 	UploadStatusCanceled  = "canceled"
 )
 
-// ErrNotFound 是 Store.Get 找不到记录时应返回的哨兵错误(各实现把驱动错误映射到它)。
+// ErrNotFound is the sentinel error Store.Get should return when a record isn't found
+// (each implementation maps its driver errors to it).
 var ErrNotFound = errors.New("upload task not found")
 
-// UploadTask 是上传任务真相源。字段含 gorm tag(纯字符串,不引入 gorm 依赖)。
+// UploadTask is the source of truth for an upload task. Fields carry gorm tags (plain strings, no gorm dependency).
 type UploadTask struct {
 	ID           string `gorm:"column:id;primaryKey" json:"id"`
 	OwnerUserID  string `gorm:"column:owner_user_id;index" json:"owner_user_id"`

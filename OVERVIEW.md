@@ -1,79 +1,79 @@
-# NimoOS-Common 详解
+# NimoOS-Common In Depth
 
-NimoOS-Common 是所有 NimoOS 微服务共用的基础库，提供日志、JWT、HTTP 工具、文件操作、系统管理、服务间通信等核心能力。
-
----
-
-## 核心职责
-
-- 统一的结构化日志（zap 封装，支持日志轮转，并接管 zap 全局 logger）
-- JWT 生成与验证（ECDSA P-256）
-- 超时感知的 HTTP 客户端工具
-- 文件和目录操作工具
-- 系统命令执行（含注入防护）
-- 端口和网络工具
-- systemd 服务管理接口
-- 各微服务的客户端接口封装（Gateway、MessageBus、UserService、KVM 等）
-- 可恢复上传引擎通用内核（`upload/`，供 tus 类上传服务复用）
-- 存储分区探测与推荐路径分配（`utils/storage/`）
-- GPU 探测与利用率采集（NVIDIA / Intel）
-- 标准错误码与响应格式
-- 版本解析与数据迁移工具
+NimoOS-Common is the shared base library used by all NimoOS microservices, providing core capabilities like logging, JWT, HTTP utilities, file operations, system management, and inter-service communication.
 
 ---
 
-## 目录结构
+## Core Responsibilities
+
+- Unified structured logging (zap wrapper, supports log rotation, takes over the zap global logger)
+- JWT generation and verification (ECDSA P-256)
+- Timeout-aware HTTP client utilities
+- File and directory operation utilities
+- System command execution (with injection protection)
+- Port and network utilities
+- systemd service management interface
+- Client interface wrappers for each microservice (Gateway, MessageBus, UserService, KVM, etc.)
+- Common kernel for the resumable upload engine (`upload/`, reused by tus-style upload services)
+- Storage partition detection and recommended path allocation (`utils/storage/`)
+- GPU detection and utilization collection (NVIDIA / Intel)
+- Standard error codes and response format
+- Version parsing and data migration utilities
+
+---
+
+## Directory Structure
 
 ```
 NimoOS-Common/
-├── model/                   # 共享数据模型
-│   ├── sys_common.go        # Result 标准响应结构
-│   ├── device.go            # DeviceInfo（网络、硬件）
-│   ├── app_info.go          # ComposeApp 元数据
-│   └── gateway.go           # Route、ChangePortRequest、SSLConfigRequest/Response
-├── upload/                  # 可恢复上传引擎通用内核（模型/状态机/Store 接口/分级 GC）
+├── model/                   # shared data models
+│   ├── sys_common.go        # Result standard response struct
+│   ├── device.go            # DeviceInfo (network, hardware)
+│   ├── app_info.go           # ComposeApp metadata
+│   └── gateway.go           # Route, ChangePortRequest, SSLConfigRequest/Response
+├── upload/                  # common kernel for the resumable upload engine (model/state machine/Store interface/tiered GC)
 ├── utils/
-│   ├── logger/              # zap 日志封装（文件轮转 + ReplaceGlobals）
-│   ├── jwt/                 # ECDSA JWT 生成/验证/JWKS + Echo 中间件
-│   ├── http/                # 超时 HTTP 客户端（Get/Post/Put/Delete）
-│   ├── file/                # 文件/目录操作、归档
-│   ├── command/             # shell 命令执行
-│   ├── exec/                # 安全命令执行（防 shell 注入）
-│   ├── port/                # 端口探测工具
-│   ├── systemctl/           # systemd 服务管理（via dbus）
-│   ├── ssh/                 # SSH 客户端 + WebSocket 终端
-│   ├── storage/             # 物理分区探测、存储路径推荐
-│   ├── version/             # 版本解析、迁移状态追踪
-│   ├── random/              # 随机名称/字符串生成
-│   ├── constants/           # 系统标准路径常量
-│   └── common_err/          # 标准错误码
+│   ├── logger/              # zap logging wrapper (file rotation + ReplaceGlobals)
+│   ├── jwt/                 # ECDSA JWT generation/verification/JWKS + Echo middleware
+│   ├── http/                # timeout-aware HTTP client (Get/Post/Put/Delete)
+│   ├── file/                # file/directory operations, archiving
+│   ├── command/             # shell command execution
+│   ├── exec/                # safe command execution (shell injection protection)
+│   ├── port/                # port detection utilities
+│   ├── systemctl/           # systemd service management (via dbus)
+│   ├── ssh/                 # SSH client + WebSocket terminal
+│   ├── storage/             # physical partition detection, storage path recommendation
+│   ├── version/             # version parsing, migration status tracking
+│   ├── random/              # random name/string generation
+│   ├── constants/           # standard system path constants
+│   └── common_err/          # standard error codes
 ├── middleware/
-│   └── echo.go              # CORS 中间件（Echo 框架）
-├── external/                # 各微服务客户端接口
-│   ├── gateway.go           # Gateway 路由注册
-│   ├── user_service.go      # 获取 JWT 公钥
-│   ├── message_bus.go       # 事件发布
-│   ├── app_manage.go        # App 状态查询
-│   ├── notify.go            # 系统通知发送
-│   ├── share.go             # Samba 共享删除（NimoOS 核心服务）
-│   ├── kvm_service.go       # KVM 服务地址发现
-│   ├── gpu.go               # NVIDIA GPU 检测（nvidia-smi）
-│   └── gpu_intel.go         # Intel GPU 利用率采集（intel_gpu_top）
-└── interfaces.go            # MigrationTool 接口定义
+│   └── echo.go              # CORS middleware (Echo framework)
+├── external/                # client interfaces for each microservice
+│   ├── gateway.go           # Gateway route registration
+│   ├── user_service.go      # fetch JWT public key
+│   ├── message_bus.go       # event publishing
+│   ├── app_manage.go        # App status queries
+│   ├── notify.go            # system notification sending
+│   ├── share.go             # Samba share deletion (NimoOS core service)
+│   ├── kvm_service.go       # KVM service address discovery
+│   ├── gpu.go               # NVIDIA GPU detection (nvidia-smi)
+│   └── gpu_intel.go         # Intel GPU utilization collection (intel_gpu_top)
+└── interfaces.go            # MigrationTool interface definition
 ```
 
 ---
 
-## 核心模块详解
+## Core Modules In Depth
 
-### 日志（logger）
+### Logging (logger)
 
-基于 `go.uber.org/zap`，封装了文件轮转：
+Built on `go.uber.org/zap`, wraps file rotation:
 
-- 自动写入文件 + 控制台双输出
-- 日志轮转：单文件最大 10MB，保留 60 个备份，1 天保留期
-- 自动注入调用者信息（函数名、文件、行号）
-- **接管 zap 全局 logger**：`LogInitWithWriterSyncers` 末尾调用 `zap.ReplaceGlobals`，使 `zap.L()`/`zap.S()` 指向已初始化实例（`utils/logger/log.go`）。下游服务（如 Photos）大量直接使用 `zap.L()`，不 Replace 的话这些日志会全部进入 zap 默认的 no-op logger 被静默丢弃
+- Automatic dual output to file + console
+- Log rotation: 10MB max per file, 60 backups kept, 1-day retention
+- Automatically injects caller info (function name, file, line number)
+- **Takes over the zap global logger**: `LogInitWithWriterSyncers` calls `zap.ReplaceGlobals` at the end, so `zap.L()`/`zap.S()` point at the initialized instance (`utils/logger/log.go`). Downstream services (e.g. Photos) call `zap.L()` directly a lot; without this Replace those logs would all land in zap's default no-op logger and get silently dropped
 
 ```go
 logger.LogInit("/var/log/nimoos", "nimoos", "log")
@@ -83,40 +83,40 @@ zap.L().Info("also lands in the same file/console sinks")
 
 ---
 
-### JWT 工具（jwt）
+### JWT Utilities (jwt)
 
-ECDSA P-256（ES256）签名：
+ECDSA P-256 (ES256) signing:
 
 ```go
-// 密钥对生成
+// key pair generation
 GenerateKeyPair() (*ecdsa.PrivateKey, *ecdsa.PublicKey, error)
 
-// 令牌签发
-GetAccessToken(username, privateKey, id)   // 3 小时有效
-GetRefreshToken(username, privateKey, id)  // 7 天有效
+// token issuance
+GetAccessToken(username, privateKey, id)   // valid for 3 hours
+GetRefreshToken(username, privateKey, id)  // valid for 7 days
 
-// 令牌验证
+// token verification
 Validate(token string, publicKeyFunc) (bool, *Claims, error)
 
-// Echo 中间件（自动跳过 localhost）
+// Echo middleware (auto-skips localhost)
 JWT(publicKeyFunc) echo.MiddlewareFunc
 
-// JWKS 端点
-JWKSHandler(jwksJSON) http.Handler        // 服务 /.well-known/jwks.json
+// JWKS endpoint
+JWKSHandler(jwksJSON) http.Handler        // serves /.well-known/jwks.json
 ```
 
-**Echo 中间件的 token 提取约定**（`utils/jwt/jwt_helper.go` 的 `JWT()`）：
+**Token extraction convention for the Echo middleware** (`JWT()` in `utils/jwt/jwt_helper.go`):
 
-- Skipper：`RealIP` 为 `127.0.0.1` / `::1` 时跳过验证（localhost 免验）。
-- token 来源：优先取 **`Authorization` 头的原始整值**，缺失时回退 `?token=` 查询参数。
-- **重要**：提取器不剥离 `"Bearer "` 前缀，头的值被原样送进 ES256 验签——即当前只接受**裸 JWT**。NimoOS-UI 的 axios 正是这样发的（`NimoOS-UI/src/service/service.js` / `index.js` 中 `headers.Authorization = token`，无 `Bearer ` 前缀），带标准 `Bearer ` 前缀的请求反而会验签失败。改动 `TokenLookupFuncs` 时必须保持对裸 JWT 的兼容；若要支持标准 Bearer 形式，须两种形式都接受。
-- 验证通过后把 `claims.ID` 写入请求头 `user_id`，供下游 handler 读取。
+- Skipper: skips verification when `RealIP` is `127.0.0.1` / `::1` (localhost is exempt).
+- Token source: prefers the **raw value of the `Authorization` header**, falling back to the `?token=` query parameter if missing.
+- **Important**: the extractor does not strip the `"Bearer "` prefix — the header value is fed straight into ES256 verification, meaning only a **bare JWT** is currently accepted. This is exactly how NimoOS-UI's axios sends it (`headers.Authorization = token` in `NimoOS-UI/src/service/service.js` / `index.js`, no `Bearer ` prefix); a request with the standard `Bearer ` prefix would actually fail verification. Any change to `TokenLookupFuncs` must preserve compatibility with the bare JWT form; supporting the standard Bearer form means accepting both.
+- On successful verification, `claims.ID` is written into the `user_id` request header for downstream handlers to read.
 
 ---
 
-### HTTP 客户端（http）
+### HTTP Client (http)
 
-所有请求携带超时上下文，防止 goroutine 泄漏：
+Every request carries a timeout context to prevent goroutine leaks:
 
 ```go
 Get(url, timeout)
@@ -128,42 +128,42 @@ GetWithHeader(url, timeout, headers)
 
 ---
 
-### 文件工具（file）
+### File Utilities (file)
 
-- 文件读写、创建、删除、重命名
-- 目录创建、删除、大小统计、空目录检测
-- 文件/目录递归复制与移动
-- 归档操作（zip、tar.gz、tar.bz2、tar.xz 等）
-- 无重名冲突的文件命名（自动追加编号）
-
----
-
-### 可恢复上传内核（upload）
-
-从上传服务中抽取的通用内核（`upload/`），不依赖 gorm/tusd/echo，供各使用方自带存储与 HTTP 层：
-
-- `UploadTask`：上传任务真相源（表名 `o_upload_tasks`；gorm tag 仅为纯 struct tag 字符串，原生 SQL 使用方可忽略）
-- 状态常量：`uploading` / `paused` / `failed` / `completed` / `canceled`（`upload/task.go`）
-- `Store` 接口 + 哨兵错误 `ErrNotFound`；`Cancel(s, id, expiresAt)` 幂等取消助手（`upload/store.go`）
-- `NewTask(...)` 工厂（`upload/factory.go`）
-- 分级 GC：`SweepTasks` 单轮清扫 + `StartGC` 周期循环，按 `GCConfig{StagingDir, PausedTTL, GCIntervalSecs}` 清理暂存目录与过期任务；写侧 TTL 由调用方用 `Default*Seconds` 常量传入（`upload/gc.go`、`upload/config.go`）
+- File read/write, create, delete, rename
+- Directory creation, deletion, size stats, empty-directory detection
+- Recursive file/directory copy and move
+- Archive operations (zip, tar.gz, tar.bz2, tar.xz, etc.)
+- Collision-free file naming (auto-appends a number)
 
 ---
 
-### 存储分配（storage）
+### Resumable Upload Kernel (upload)
 
-`utils/storage/allocator.go`：
+A common kernel extracted from the upload services (`upload/`), with no dependency on gorm/tusd/echo — each caller brings its own storage and HTTP layer:
+
+- `UploadTask`: source of truth for an upload task (table name `o_upload_tasks`; gorm tags are plain struct tag strings only, raw-SQL callers can ignore them)
+- Status constants: `uploading` / `paused` / `failed` / `completed` / `canceled` (`upload/task.go`)
+- `Store` interface + sentinel error `ErrNotFound`; `Cancel(s, id, expiresAt)` idempotent-cancel helper (`upload/store.go`)
+- `NewTask(...)` factory (`upload/factory.go`)
+- Tiered GC: `SweepTasks` does a single sweep pass + `StartGC` loops it periodically, cleaning up staging directories and expired tasks per `GCConfig{StagingDir, PausedTTL, GCIntervalSecs}`; write-side TTLs are passed in by the caller via the `Default*Seconds` constants (`upload/gc.go`, `upload/config.go`)
+
+---
+
+### Storage Allocation (storage)
+
+`utils/storage/allocator.go`:
 
 ```go
-GetPhysicalPartitions()    // 解析 /proc/mounts + syscall.Statfs，仅统计物理/持久文件系统分区
-RecommendStoragePaths()    // 推荐 Docker/AppData/UserData/SystemData 落盘路径
+GetPhysicalPartitions()    // parses /proc/mounts + syscall.Statfs, counting only physical/persistent filesystem partitions
+RecommendStoragePaths()    // recommends on-disk paths for Docker/AppData/UserData/SystemData
 ```
 
 ---
 
-### 安全命令执行（exec）
+### Safe Command Execution (exec)
 
-使用 `google/safetext` 防止 shell 注入：
+Uses `google/safetext` to prevent shell injection:
 
 ```go
 cmd := exec.Command("docker", "ps")
@@ -172,9 +172,9 @@ output, err := cmd.CombinedOutput()
 
 ---
 
-### 系统管理工具（systemctl）
+### System Management Utilities (systemctl)
 
-通过 systemd dbus 接口管理服务：
+Manages services through the systemd dbus interface:
 
 ```go
 systemctl.ListServices(pattern, wait)
@@ -186,68 +186,68 @@ systemctl.EnableService(nameOrPath, wait)
 
 ---
 
-### 版本与迁移（version）
+### Version & Migration (version)
 
 ```go
 ParseVersion("v0.4.3-beta") // → major=0, minor=4, patch=3
 Compare(v1, v2 string) int  // -1, 0, 1
 
-// 迁移状态追踪（存储于 /var/lib/nimoos/migration/）
+// migration status tracking (stored under /var/lib/nimoos/migration/)
 GetGlobalMigrationStatus(serviceName)
 status.Done(version)
 ```
 
 ---
 
-## 外部服务客户端（external）
+## External Service Clients (external)
 
-各服务通过读取 `/var/run/nimoos/*.url` 文件发现其他服务地址：
+Each service discovers other services' addresses by reading `/var/run/nimoos/*.url` files:
 
-| 客户端 | 功能 | 地址文件 |
+| Client | Function | Address file |
 |---|---|---|
-| `GetPublicKey(runtimePath)` | 获取 UserService JWT 公钥 | `user-service.url` |
-| `NewManagementService(path)` | Gateway 路由注册/端口管理 | `management.url` |
-| `NewNotifyService(path)` | 发送系统通知 | `nimoos.url` |
-| `NewAppManageService(path)` | 查询/更新 App 状态 | `app-management.url` |
-| `NewShareService(path)` | 删除 Samba 共享（`/v1/samba/shares`） | `nimoos.url` |
-| `GetKVMServiceAddress(runtimePath)` | KVM 服务地址发现 | `kvm-service.url` |
-| `PublishEventInSocket(...)` | 通过 Unix socket 发布事件到 MessageBus | `message-bus.sock` |
+| `GetPublicKey(runtimePath)` | fetch UserService's JWT public key | `user-service.url` |
+| `NewManagementService(path)` | Gateway route registration/port management | `management.url` |
+| `NewNotifyService(path)` | send system notifications | `nimoos.url` |
+| `NewAppManageService(path)` | query/update App status | `app-management.url` |
+| `NewShareService(path)` | delete Samba shares (`/v1/samba/shares`) | `nimoos.url` |
+| `GetKVMServiceAddress(runtimePath)` | KVM service address discovery | `kvm-service.url` |
+| `PublishEventInSocket(...)` | publish events to MessageBus over a Unix socket | `message-bus.sock` |
 
-Gateway / AppManage 等客户端构造时先等待地址文件出现（最多重试 10 次、间隔 1s），再向 `/ping` 做一次健康检查（`external/common.go`）。
+When constructing clients like Gateway / AppManage, the code first waits for the address file to appear (up to 10 retries, 1s apart), then does a single health check against `/ping` (`external/common.go`).
 
-**GPU 采集**（不走 `.url` 发现，直接调本机命令）：
+**GPU collection** (does not go through `.url` discovery, calls local commands directly):
 
-- `NvidiaGPUInfoList()`：经 nvidia-smi 查询 NVIDIA GPU（`external/gpu.go`）
-- `StartIntelGpuMonitor()` + `GetIntelGpuStat()`：后台 goroutine 跑 `intel_gpu_top -J -s 1000` 流式解析，维护最新一帧（engines 最大 busy 作为整体利用率，附功率/频率）；`intel_gpu_top` 不存在或缓存超过 5s 时返回 not-ok，调用方据此降级（`external/gpu_intel.go`）
+- `NvidiaGPUInfoList()`: queries NVIDIA GPUs via nvidia-smi (`external/gpu.go`)
+- `StartIntelGpuMonitor()` + `GetIntelGpuStat()`: a background goroutine runs `intel_gpu_top -J -s 1000`, streaming and parsing it while keeping the latest frame (the max busy value across engines is used as overall utilization, plus power/frequency); returns not-ok when `intel_gpu_top` isn't present or the cache is more than 5s stale, so callers can degrade accordingly (`external/gpu_intel.go`)
 
 ---
 
-## 标准响应格式
+## Standard Response Format
 
 ```go
 type Result struct {
-    Success int         // HTTP 状态码（200/400/401/500）
-    Message string      // 可读消息
-    Data    interface{} // 响应数据
+    Success int         // HTTP status code (200/400/401/500)
+    Message string      // human-readable message
+    Data    interface{} // response data
 }
 ```
 
 ---
 
-## 标准错误码
+## Standard Error Codes
 
-| 范围 | 类别 |
+| Range | Category |
 |---|---|
-| 200/400/401/429/500 | HTTP 状态 |
-| 10001–10013 | 用户相关（密码、账户、权限） |
-| 20001–20006 | 系统相关（文件、端口） |
-| 40001–40005 | 磁盘相关（格式化、挂载） |
-| 50001–50004 | 应用相关（卸载、镜像） |
-| 60001–60005 | 文件操作 |
+| 200/400/401/429/500 | HTTP status |
+| 10001–10013 | user-related (password, account, permissions) |
+| 20001–20006 | system-related (files, ports) |
+| 40001–40005 | disk-related (formatting, mounting) |
+| 50001–50004 | app-related (uninstall, image) |
+| 60001–60005 | file operations |
 
 ---
 
-## 系统标准路径
+## Standard System Paths
 
 ```go
 DefaultConfigPath   = "/etc/nimoos"
@@ -259,12 +259,12 @@ DefaultConstantPath = "/usr/share/nimoos"
 
 ---
 
-## 技术栈
+## Tech Stack
 
-- **日志**：go.uber.org/zap + lumberjack
-- **JWT**：golang-jwt/jwt v4（ECDSA P-256）
-- **Web**：labstack/echo v4
-- **WebSocket**：gorilla/websocket
-- **systemd**：coreos/go-systemd/v22
-- **命令安全**：google/safetext
-- **归档**：mholt/archiver v3
+- **Logging**: go.uber.org/zap + lumberjack
+- **JWT**: golang-jwt/jwt v4 (ECDSA P-256)
+- **Web**: labstack/echo v4
+- **WebSocket**: gorilla/websocket
+- **systemd**: coreos/go-systemd/v22
+- **Command safety**: google/safetext
+- **Archiving**: mholt/archiver v3

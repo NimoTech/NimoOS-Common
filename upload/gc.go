@@ -9,23 +9,23 @@ import (
 	"go.uber.org/zap"
 )
 
-// removeStaging 删除 staging 目录中指定任务的数据文件与 .info 文件(忽略不存在错误)。
+// removeStaging deletes the given task's data file and .info file from the staging directory (ignores not-exist errors).
 func removeStaging(dir, id string) {
-	os.Remove(filepath.Join(dir, id))          //nolint:errcheck
+	os.Remove(filepath.Join(dir, id))         //nolint:errcheck
 	os.Remove(filepath.Join(dir, id+".info")) //nolint:errcheck
 }
 
-// SweepTasks 执行一次分级 GC 扫描:
-//   - uploading(过期) → SetStatus paused(now+PausedTTL),不删 staging → transitioned++
-//   - paused/failed/canceled(过期) → removeStaging + Delete → deleted++
+// SweepTasks runs one pass of tiered GC scanning:
+//   - uploading (expired) → SetStatus paused (now+PausedTTL), staging kept → transitioned++
+//   - paused/failed/canceled (expired) → removeStaging + Delete → deleted++
 //
-// 返回本轮 transitioned/deleted 计数与首个遇到的错误(遇错即返回)。
+// Returns this pass's transitioned/deleted counts and the first error encountered (returns immediately on error).
 func SweepTasks(s Store, cfg GCConfig, now time.Time) (transitioned, deleted int, err error) {
 	due, e := s.ListDueForGC(now.Unix())
 	if e != nil {
 		return 0, 0, e
 	}
-	// 目录列表每轮解析一次(枚举有真实 IO,与 batch_sweeper 的每轮一次语义对齐)。
+	// Directory list is resolved once per pass (enumeration does real IO, matching batch_sweeper's once-per-pass semantics).
 	dirs := []string{cfg.StagingDir}
 	if cfg.StagingDirs != nil {
 		dirs = cfg.StagingDirs()
@@ -50,8 +50,8 @@ func SweepTasks(s Store, cfg GCConfig, now time.Time) (transitioned, deleted int
 	return transitioned, deleted, nil
 }
 
-// StartGC 在独立 goroutine 中按 GCConfig.GCIntervalSecs 定期调用 SweepTasks。
-// 若 GCIntervalSecs <= 0,则使用 DefaultGCIntervalSeconds。
+// StartGC calls SweepTasks periodically in its own goroutine, per GCConfig.GCIntervalSecs.
+// If GCIntervalSecs <= 0, DefaultGCIntervalSeconds is used instead.
 func StartGC(s Store, cfg GCConfig) {
 	interval := cfg.GCIntervalSecs
 	if interval <= 0 {

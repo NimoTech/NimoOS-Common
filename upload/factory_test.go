@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// TestNewTask 验证 NewTask 工厂的字段映射。
+// TestNewTask verifies the field mapping of the NewTask factory.
 func TestNewTask(t *testing.T) {
 	now := time.Unix(1700000000, 0)
 	idle := DefaultIdleTimeoutSeconds
@@ -61,7 +61,7 @@ func TestNewTask(t *testing.T) {
 		t.Fatalf("ExpiresAt mismatch: got %d, want %d", task.ExpiresAt, expectedExpires)
 	}
 
-	// ClientMeta 须含 user_agent 和 remote_addr
+	// ClientMeta must contain user_agent and remote_addr
 	var cm map[string]string
 	if err := json.Unmarshal([]byte(task.ClientMeta), &cm); err != nil {
 		t.Fatalf("ClientMeta not valid JSON: %v", err)
@@ -74,12 +74,12 @@ func TestNewTask(t *testing.T) {
 	}
 }
 
-// TestNewTaskRelativePathFallback 验证 relativePath 为空时回退到 filename。
+// TestNewTaskRelativePathFallback verifies that an empty relativePath falls back to filename.
 func TestNewTaskRelativePathFallback(t *testing.T) {
 	now := time.Now()
 	meta := map[string]string{
 		"filename": "backup.tar.gz",
-		// relativePath 故意省略
+		// relativePath intentionally omitted
 	}
 	task := NewTask("id-2", "owner-1", meta, 0, "", "", DefaultIdleTimeoutSeconds, now)
 	if task.RelativePath != "backup.tar.gz" {
