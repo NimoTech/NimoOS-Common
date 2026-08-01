@@ -17,6 +17,12 @@
 > [SECURITY.md](https://github.com/NimoTech/NimoOS/blob/main/SECURITY.md#known-limitations)
 > before deploying NimoOS for more than one person.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/NimoTech/NimoOS-Common.svg)](https://pkg.go.dev/github.com/NimoTech/NimoOS-Common) [![Go Report Card](https://goreportcard.com/badge/github.com/NimoTech/NimoOS-Common)](https://goreportcard.com/report/github.com/NimoTech/NimoOS-Common) [![codecov](https://codecov.io/github/NimoTech/NimoOS-Common/branch/main/graph/badge.svg?token=KDJ5KAFX2Q)](https://codecov.io/github/NimoTech/NimoOS-Common)
-
 Common structs and functions for NimoOS
+
+## Documentation
+
+See [OVERVIEW.md](./OVERVIEW.md) for architecture details.
+
+## License
+
+Apache-2.0 — see [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
