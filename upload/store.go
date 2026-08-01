@@ -2,30 +2,31 @@ package upload
 
 import "errors"
 
-// Store 是上传任务的持久化接口。各服务自行实现(GORM/原生 SQL 均可),
-// 通用内核(Cancel/SweepTasks/StartGC)只依赖此接口,不依赖任何具体驱动。
+// Store is the persistence interface for upload tasks. Each service implements it on
+// its own (GORM or raw SQL, either works); the common kernel (Cancel/SweepTasks/StartGC)
+// depends only on this interface, not on any concrete driver.
 type Store interface {
-	// Create 持久化一条新任务记录。
+	// Create persists a new task record.
 	Create(t *UploadTask) error
-	// Get 按 id 查询任务;缺失时必须返回 ErrNotFound。
+	// Get looks up a task by id; must return ErrNotFound when missing.
 	Get(id string) (*UploadTask, error)
-	// ListActiveByOwner 返回指定 owner 的活跃任务(uploading/paused/failed)。
+	// ListActiveByOwner returns the given owner's active tasks (uploading/paused/failed).
 	ListActiveByOwner(owner string) ([]UploadTask, error)
-	// ListDueForGC 返回 expires_at > 0 且 <= now 的任务。
+	// ListDueForGC returns tasks with expires_at > 0 and <= now.
 	ListDueForGC(now int64) ([]UploadTask, error)
-	// UpdateOffset 更新已上传字节数及续期过期时间。
+	// UpdateOffset updates the uploaded byte offset and renews the expiry time.
 	UpdateOffset(id string, offset, expiresAt int64) error
-	// SetStatus 更新任务状态及过期时间。
+	// SetStatus updates the task's status and expiry time.
 	SetStatus(id, status string, expiresAt int64) error
-	// SetFailed 将任务标记为失败并记录错误信息。
+	// SetFailed marks the task as failed and records the error message.
 	SetFailed(id, errMsg string, lastErrorAt, expiresAt int64) error
-	// Delete 物理删除任务记录。
+	// Delete physically removes the task record.
 	Delete(id string) error
 }
 
-// Cancel 幂等取消指定任务。
-//   - 任务不存在(ErrNotFound)、已完成(completed)、已取消(canceled) → 返回 (false, nil)。
-//   - 其余状态(uploading/paused/failed) → 置 canceled、更新 expiresAt → 返回 (true, nil)。
+// Cancel idempotently cancels the given task.
+//   - Task not found (ErrNotFound), already completed, or already canceled → returns (false, nil).
+//   - Any other status (uploading/paused/failed) → set to canceled, update expiresAt → returns (true, nil).
 func Cancel(s Store, id string, expiresAt int64) (bool, error) {
 	t, err := s.Get(id)
 	if errors.Is(err, ErrNotFound) {

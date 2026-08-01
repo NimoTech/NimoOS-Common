@@ -5,19 +5,20 @@ import (
 	"time"
 )
 
-// NewTask 从上传元数据构造一个新的 UploadTask 实例(不持久化)。
-// 调用方负责把返回值传给 Store.Create。
+// NewTask builds a new UploadTask instance from upload metadata (not persisted).
+// The caller is responsible for passing the returned value to Store.Create.
 //
-// 参数说明:
-//   - id:          tusd 或其它上传协议分配的上传 ID。
-//   - ownerID:     经各服务 handler 取值后传入(NimoOS 用 user_id header,Photos 用 X-NimoOS-User-ID)。
-//   - meta:        tusd MetaData / 其它 map;使用 "filename"/"targetPath"/"relativePath"/
-//                  "filetype"/"fingerprint"/"batch_id"/"client_id" 等键。
-//   - size:        文件总字节数。
-//   - userAgent:   请求 User-Agent header。
-//   - remoteAddr:  请求来源 IP。
-//   - idleTimeout: 空闲超时秒数(通常 DefaultIdleTimeoutSeconds)。
-//   - now:         当前时间(便于测试注入)。
+// Parameters:
+//   - id:          the upload ID assigned by tusd or another upload protocol.
+//   - ownerID:     passed in after each service's handler extracts it (NimoOS uses
+//     the user_id header, Photos uses X-NimoOS-User-ID).
+//   - meta:        tusd MetaData / another map; uses the "filename"/"targetPath"/
+//     "relativePath"/"filetype"/"fingerprint"/"batch_id"/"client_id" keys.
+//   - size:        total file size in bytes.
+//   - userAgent:   the request's User-Agent header.
+//   - remoteAddr:  the request's source IP.
+//   - idleTimeout: idle timeout in seconds (usually DefaultIdleTimeoutSeconds).
+//   - now:         current time (for test injection).
 func NewTask(id, ownerID string, meta map[string]string, size int64,
 	userAgent, remoteAddr string, idleTimeout int64, now time.Time) *UploadTask {
 

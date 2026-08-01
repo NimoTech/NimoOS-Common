@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// fakeStore 是仅用于测试的内存 Store 实现。
+// fakeStore is an in-memory Store implementation used only for testing.
 type fakeStore struct {
 	m map[string]*UploadTask
 }
@@ -88,7 +88,7 @@ func (f *fakeStore) Delete(id string) error {
 	return nil
 }
 
-// TestCancelIdempotent 验证 Cancel 的幂等语义。
+// TestCancelIdempotent verifies Cancel's idempotent semantics.
 func TestCancelIdempotent(t *testing.T) {
 	now := time.Now()
 	expires := now.Unix() + 3600

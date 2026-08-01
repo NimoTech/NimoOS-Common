@@ -7,13 +7,15 @@ const (
 	DefaultGCIntervalSeconds  = int64(60 * 60)
 )
 
-// GCConfig 仅含 SweepTasks 实际使用的字段;写侧 TTL(idle/canceled)由调用方用
-// Default*Seconds 常量在 NewTask/Cancel/SetStatus 时传入。
+// GCConfig only holds the fields SweepTasks actually uses; write-side TTLs
+// (idle/canceled) are passed in by the caller via the Default*Seconds constants
+// at NewTask/Cancel/SetStatus time.
 type GCConfig struct {
 	StagingDir string
-	// StagingDirs 非 nil 时,GC 删除任务残片会对返回的每个目录都尝试
-	// removeStaging——per-volume 暂存路由(NimoOS route/v2/tus_routing_store)
-	// 之后残片可能不在 StagingDir。nil 退化为仅 StagingDir,与旧行为一致。
+	// When StagingDirs is non-nil, GC tries removeStaging against every
+	// directory it returns — after per-volume staging routing (NimoOS
+	// route/v2/tus_routing_store), leftovers may not be in StagingDir.
+	// nil falls back to StagingDir only, matching the old behavior.
 	StagingDirs    func() []string
 	PausedTTL      int64
 	GCIntervalSecs int64

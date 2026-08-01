@@ -109,16 +109,16 @@ func MustOpen(fileName, filePath string) (*os.File, error) {
 	return f, nil
 }
 
-// 判断所给路径文件/文件夹是否存在
+// Exists reports whether the given path (file or directory) exists
 func Exists(path string) bool {
-	_, err := os.Stat(path) // os.Stat获取文件信息
+	_, err := os.Stat(path) // os.Stat gets file info
 	if err != nil {
 		return os.IsExist(err)
 	}
 	return true
 }
 
-// 判断所给路径是否为文件夹
+// IsDir reports whether the given path is a directory
 func IsDir(path string) bool {
 	s, err := os.Stat(path)
 	if err != nil {
@@ -127,7 +127,7 @@ func IsDir(path string) bool {
 	return s.IsDir()
 }
 
-// 判断所给路径是否为文件
+// IsFile reports whether the given path is a file
 func IsFile(path string) bool {
 	return !IsDir(path)
 }
@@ -352,7 +352,7 @@ func WriteToFullPath(data []byte, fullPath string, perm fs.FileMode) error {
 	return err
 }
 
-// 最终拼接
+// SpliceFiles does the final splice
 func SpliceFiles(dir, path string, length int, startPoint int) error {
 	fullPath := path
 

@@ -12,7 +12,7 @@ import (
 	"github.com/samber/lo"
 )
 
-// 获取可用端口
+// GetAvailablePort obtains a free port
 func GetAvailablePort(t string) (int, error) {
 	address := fmt.Sprintf("%s:0", "0.0.0.0")
 	if t == "udp" {
@@ -44,7 +44,7 @@ func GetAvailablePort(t string) (int, error) {
 	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
-// 判断端口是否可以（未被占用）
+// IsPortAvailable reports whether the port is free (not occupied)
 // param t tcp/udp
 func IsPortAvailable(port int, t string) bool {
 	address := fmt.Sprintf("%s:%d", "0.0.0.0", port)

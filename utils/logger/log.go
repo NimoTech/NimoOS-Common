@@ -18,7 +18,7 @@ var loggers *zap.Logger
 var once sync.Once
 
 func getFileLogWriter(logPath string, logFileName string, logFileExt string) (writeSyncer zapcore.WriteSyncer) {
-	// 使用 lumberjack 实现 log rotate
+	// use lumberjack for log rotation
 	lumberJackLogger := &lumberjack.Logger{
 		Filename:   filepath.Join(logPath, fmt.Sprintf("%s.%s", logFileName, logFileExt)),
 		MaxSize:    10,
@@ -42,8 +42,9 @@ func LogInitWithWriterSyncers(syncers ...zapcore.WriteSyncer) {
 		),
 	)
 
-	// 让 zap.L()/zap.S() 指向同一个已初始化 logger：下游服务（Photos 等）
-	// 大量使用 zap.L()，不 Replace 的话那些日志全部打进 zap 默认的 no-op logger 被静默丢弃。
+	// Point zap.L()/zap.S() at this same initialized logger: downstream services
+	// (Photos, etc.) call zap.L() heavily, and without this Replace those logs all
+	// go to zap's default no-op logger and get silently dropped.
 	zap.ReplaceGlobals(loggers)
 }
 
@@ -76,12 +77,12 @@ func Error(message string, fields ...zap.Field) {
 }
 
 func getCallerInfoForLog() (callerFields []zap.Field) {
-	pc, file, line, ok := runtime.Caller(2) // 回溯两层，拿到写日志的调用方的函数信息
+	pc, file, line, ok := runtime.Caller(2) // walk back two frames to get the logging caller's function info
 	if !ok {
 		return
 	}
 	funcName := runtime.FuncForPC(pc).Name()
-	funcName = path.Base(funcName) // Base函数返回路径的最后一个元素，只保留函数名
+	funcName = path.Base(funcName) // Base returns the last element of the path, keeping only the function name
 
 	callerFields = append(callerFields, zap.String("func", funcName), zap.String("file", file), zap.Int("line", line))
 	return

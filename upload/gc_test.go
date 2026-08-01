@@ -7,18 +7,18 @@ import (
 	"time"
 )
 
-// TestSweepTasksTieredCleanup 验证分级 GC 语义:
-//   - canceled(过期) → removeStaging + Delete(deleted++)
-//   - uploading(过期) → SetStatus paused,不删 staging(transitioned++)
-//   - paused(未过期) → 不处理
-//   - completed(expires=0) → 不处理
+// TestSweepTasksTieredCleanup verifies tiered GC semantics:
+//   - canceled (expired) → removeStaging + Delete (deleted++)
+//   - uploading (expired) → SetStatus paused, staging kept (transitioned++)
+//   - paused (not expired) → not processed
+//   - completed (expires=0) → not processed
 func TestSweepTasksTieredCleanup(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Unix(1_000_000, 0)
-	past := now.Unix() - 10 // 已过期
+	past := now.Unix() - 10 // already expired
 	future := now.Unix() + 3600
 
-	// 在 staging 目录为 canceled 任务创建伪文件
+	// create dummy files in the staging dir for the canceled task
 	canceledID := "canceled-task-id"
 	if err := os.WriteFile(filepath.Join(dir, canceledID), []byte("data"), 0644); err != nil {
 		t.Fatal(err)
@@ -27,7 +27,7 @@ func TestSweepTasksTieredCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 为 uploading 任务也创建 staging 文件(GC 不应删除它)
+	// also create a staging file for the uploading task (GC should not remove it)
 	uploadingID := "uploading-task-id"
 	uploadingFile := filepath.Join(dir, uploadingID)
 	if err := os.WriteFile(uploadingFile, []byte("partial"), 0644); err != nil {
@@ -35,13 +35,13 @@ func TestSweepTasksTieredCleanup(t *testing.T) {
 	}
 
 	s := newFakeStore()
-	// canceled 任务,已过期
+	// canceled task, expired
 	_ = s.Create(&UploadTask{ID: canceledID, Status: UploadStatusCanceled, ExpiresAt: past})
-	// uploading 任务,已过期(应转为 paused,不删 staging)
+	// uploading task, expired (should transition to paused, staging kept)
 	_ = s.Create(&UploadTask{ID: uploadingID, Status: UploadStatusUploading, ExpiresAt: past})
-	// paused 任务,未过期(不处理)
+	// paused task, not expired (not processed)
 	_ = s.Create(&UploadTask{ID: "paused-fresh", Status: UploadStatusPaused, ExpiresAt: future})
-	// completed 任务,expires=0(不处理)
+	// completed task, expires=0 (not processed)
 	_ = s.Create(&UploadTask{ID: "completed-no-expire", Status: UploadStatusCompleted, ExpiresAt: 0})
 
 	cfg := GCConfig{
@@ -55,7 +55,7 @@ func TestSweepTasksTieredCleanup(t *testing.T) {
 		t.Fatalf("SweepTasks error: %v", err)
 	}
 
-	// 断言计数
+	// assert counts
 	if transitioned != 1 {
 		t.Errorf("expected transitioned=1, got %d", transitioned)
 	}
@@ -63,7 +63,7 @@ func TestSweepTasksTieredCleanup(t *testing.T) {
 		t.Errorf("expected deleted=1, got %d", deleted)
 	}
 
-	// canceled 任务的 staging 文件应已删除
+	// canceled task's staging file should be removed
 	if _, err := os.Stat(filepath.Join(dir, canceledID)); !os.IsNotExist(err) {
 		t.Error("expected canceled staging file to be removed")
 	}
@@ -71,17 +71,17 @@ func TestSweepTasksTieredCleanup(t *testing.T) {
 		t.Error("expected canceled staging .info file to be removed")
 	}
 
-	// canceled 任务记录应已从 store 删除
+	// canceled task record should be deleted from store
 	if _, err := s.Get(canceledID); err != ErrNotFound {
 		t.Error("expected canceled task to be deleted from store")
 	}
 
-	// uploading 任务的 staging 文件应保留
+	// uploading task's staging file should be preserved
 	if _, err := os.Stat(uploadingFile); os.IsNotExist(err) {
 		t.Error("expected uploading staging file to be preserved")
 	}
 
-	// uploading 任务应转为 paused,且设置了新的 expiresAt
+	// uploading task should transition to paused, with a new expiresAt set
 	got, err := s.Get(uploadingID)
 	if err != nil {
 		t.Fatalf("Get uploading task: %v", err)
@@ -94,7 +94,7 @@ func TestSweepTasksTieredCleanup(t *testing.T) {
 		t.Errorf("expected expiresAt=%d, got %d", expectedExpires, got.ExpiresAt)
 	}
 
-	// paused-fresh 和 completed 任务应未受影响
+	// paused-fresh and completed tasks should be unaffected
 	pausedFresh, _ := s.Get("paused-fresh")
 	if pausedFresh.Status != UploadStatusPaused {
 		t.Error("paused-fresh task should not be modified")
@@ -105,7 +105,7 @@ func TestSweepTasksTieredCleanup(t *testing.T) {
 	}
 }
 
-// TestSweepTasksFailedAndPausedDeleted 验证 failed/paused(过期)都会被删除
+// TestSweepTasksFailedAndPausedDeleted verifies that both failed and paused (expired) tasks get deleted
 func TestSweepTasksFailedAndPausedDeleted(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Unix(2_000_000, 0)
@@ -114,7 +114,7 @@ func TestSweepTasksFailedAndPausedDeleted(t *testing.T) {
 	failedID := "failed-task"
 	pausedID := "paused-task"
 
-	// 创建对应 staging 文件
+	// create the corresponding staging files
 	for _, id := range []string{failedID, pausedID} {
 		_ = os.WriteFile(filepath.Join(dir, id), []byte("x"), 0644)
 	}
@@ -137,7 +137,7 @@ func TestSweepTasksFailedAndPausedDeleted(t *testing.T) {
 		t.Errorf("expected deleted=2, got %d", deleted)
 	}
 
-	// staging 文件已清理
+	// staging files should be cleaned up
 	for _, id := range []string{failedID, pausedID} {
 		if _, err := os.Stat(filepath.Join(dir, id)); !os.IsNotExist(err) {
 			t.Errorf("staging file for %s should be removed", id)
@@ -148,9 +148,10 @@ func TestSweepTasksFailedAndPausedDeleted(t *testing.T) {
 	}
 }
 
-// TestSweepTasksRemovesStagingFromAllDirs 验证 StagingDirs 非 nil 时,GC 会对每个
-// 返回的目录都尝试 removeStaging——覆盖 per-volume 暂存路由后残片不在 StagingDir
-// 的场景(dirA 为空,残片实际落在 dirB)。
+// TestSweepTasksRemovesStagingFromAllDirs verifies that when StagingDirs is non-nil, GC
+// tries removeStaging against every returned directory — covering the scenario where,
+// after per-volume staging routing, leftovers aren't in StagingDir (dirA is empty,
+// leftovers actually land in dirB).
 func TestSweepTasksRemovesStagingFromAllDirs(t *testing.T) {
 	dirA := t.TempDir()
 	dirB := t.TempDir()
@@ -158,7 +159,7 @@ func TestSweepTasksRemovesStagingFromAllDirs(t *testing.T) {
 	past := now.Unix() - 1
 
 	taskID := "t1"
-	// dirA(cfg.StagingDir)不放文件;dirB 放 t1 与 t1.info
+	// dirA (cfg.StagingDir) has no files; dirB has t1 and t1.info
 	if err := os.WriteFile(filepath.Join(dirB, taskID), []byte("data"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -197,8 +198,8 @@ func TestSweepTasksRemovesStagingFromAllDirs(t *testing.T) {
 	}
 }
 
-// TestSweepTasksNilStagingDirsFallsBack 验证 StagingDirs 为 nil 时,退化为仅清
-// cfg.StagingDir(旧行为),保持向后兼容。
+// TestSweepTasksNilStagingDirsFallsBack verifies that when StagingDirs is nil, cleanup
+// falls back to cfg.StagingDir only (the old behavior), preserving backward compatibility.
 func TestSweepTasksNilStagingDirsFallsBack(t *testing.T) {
 	dirA := t.TempDir()
 	now := time.Unix(4_000_000, 0)
