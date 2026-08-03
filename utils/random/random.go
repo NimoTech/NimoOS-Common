@@ -158,9 +158,10 @@ var (
 		"zen",
 	}
 
-	// feel free to add your first name here
+	// A word list of first names, inherited from CasaOS along with the rest of
+	// this package and used only to build throwaway identifiers. Feel free to
+	// add your own first name.
 	right = []string{
-		// NimoOS contributors
 		"allen",
 		"andres",
 		"angelina",
@@ -177,8 +178,6 @@ var (
 		"rally",
 		"tiger",
 		"xuhai",
-
-		// Some random early backers of Zimaboard
 		"aaron",
 		"abdulrahman",
 		"adrian",
