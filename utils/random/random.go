@@ -2,6 +2,8 @@ package random
 
 import (
 	"math/rand"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -438,15 +440,56 @@ var (
 	}
 )
 
-// GetRandomName generates a random name from the list of adjectives and surnames in this package formatted as "adjective_surname".
-func Name(suffix *string) string {
-	name := left[rand.Intn(len(left))] + "_" + right[rand.Intn(len(right))] //nolint:gosec // G404: Use of weak random number generator (math/rand instead of crypto/rand)
+// asciiFold maps the accented characters that appear in the contributor names
+// in `right` onto plain ASCII.
+//
+// The names are kept spelled correctly in the list, because that list is a
+// record of who was an early backer. Folding happens here, at the point of use,
+// because the main consumer is AppManagement naming a Docker Compose project
+// when the user did not supply a name, and Compose rejects anything outside
+// [a-z0-9_-]:
+//
+//	invalid project name "incredible_joão": must consist only of lowercase
+//	alphanumeric characters, hyphens, and underscores
+//
+// Four of the names carry diacritics, which made 596 of the 40677 possible
+// combinations — about one draw in seventy — a name Docker refused. That is an
+// install failing for no reason the user could act on, and a test going red
+// occasionally and never reproducibly.
+var asciiFold = strings.NewReplacer(
+	"á", "a", "à", "a", "â", "a", "ä", "a", "ã", "a", "å", "a",
+	"é", "e", "è", "e", "ê", "e", "ë", "e",
+	"í", "i", "ì", "i", "î", "i", "ï", "i",
+	"ó", "o", "ò", "o", "ô", "o", "ö", "o", "õ", "o",
+	"ú", "u", "ù", "u", "û", "u", "ü", "u",
+	"ñ", "n", "ç", "c", "ß", "ss",
+)
 
+// nameSafe keeps only what a Docker Compose project name allows, after folding
+// accents. It is a backstop: if a name is ever added to the lists that this
+// does not anticipate, the result is still usable rather than an install error.
+var nameSafe = regexp.MustCompile(`[^a-z0-9_-]`)
+
+// Name generates a name from the lists of adjectives and contributor first
+// names in this package, formatted as "adjective_name", optionally with a
+// suffix. The result is always a valid Docker Compose project name.
+func Name(suffix *string) string {
+	return nameFrom(
+		left[rand.Intn(len(left))],   //nolint:gosec // G404: Use of weak random number generator (math/rand instead of crypto/rand)
+		right[rand.Intn(len(right))], //nolint:gosec // G404
+		suffix,
+	)
+}
+
+// nameFrom is the deterministic half of Name, so a test can walk every possible
+// combination instead of sampling and hoping.
+func nameFrom(adjective, name string, suffix *string) string {
+	s := adjective + "_" + name
 	if suffix != nil {
-		name += "_" + *suffix
+		s += "_" + *suffix
 	}
 
-	return name
+	return nameSafe.ReplaceAllString(asciiFold.Replace(strings.ToLower(s)), "")
 }
 
 func String(n int, onlyLetters bool) string {
