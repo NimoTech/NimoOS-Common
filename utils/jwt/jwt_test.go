@@ -174,3 +174,45 @@ func TestJWTMiddlewareWithInvalidToken(t *testing.T) {
 	assert.Equal(t, result.Success, common_err.ERROR_AUTH_TOKEN)
 	require.NoError(t, err)
 }
+
+// TestJWTMiddlewareAcceptsBothAuthorizationForms pins down that both shapes of
+// the Authorization header work.
+//
+// The UI sends the bare JWT with no scheme; everything else — curl, generated
+// SDKs, any HTTP client's auth helper — sends "Bearer <jwt>". The extractor used
+// to hand the header to Validate verbatim, so the standard form arrived with the
+// scheme still attached and got a 401 while the bare form succeeded.
+func TestJWTMiddlewareAcceptsBothAuthorizationForms(t *testing.T) {
+	privateKey, publicKey, err := jwt.GenerateKeyPair()
+	require.NoError(t, err)
+
+	accessToken, err := jwt.GetAccessToken("testuser", privateKey, 1)
+	require.NoError(t, err)
+
+	mockPublicKeyFunc := func() (*ecdsa.PublicKey, error) { return publicKey, nil }
+
+	for name, header := range map[string]string{
+		"bare":   accessToken,
+		"bearer": "Bearer " + accessToken,
+	} {
+		t.Run(name, func(t *testing.T) {
+			router := echo.New()
+			router.Use(jwt.JWT(mockPublicKeyFunc))
+			router.GET("/test", func(c echo.Context) error {
+				return c.JSON(http.StatusOK, model.Result{Success: common_err.SUCCESS, Message: "success"})
+			})
+
+			req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+			req.Header.Set("Authorization", header)
+			respRecorder := httptest.NewRecorder()
+
+			router.ServeHTTP(respRecorder, req)
+
+			assert.Equal(t, http.StatusOK, respRecorder.Code)
+
+			result := model.Result{}
+			require.NoError(t, json.Unmarshal(respRecorder.Body.Bytes(), &result))
+			assert.Equal(t, common_err.SUCCESS, result.Success)
+		})
+	}
+}
