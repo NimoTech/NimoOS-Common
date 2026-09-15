@@ -134,6 +134,7 @@ jobs:
           # 因此放行常用的只读文本工具；写入类（sed -i、tee、>）仍不在名单内。
           claude_args: >-
             --model claude-opus-5
+            --effort max
             --max-turns 80
             --disallowedTools "Edit,Write,MultiEdit,NotebookEdit,Bash(git push:*),Bash(git commit:*),Bash(git checkout:*),Bash(git reset:*),Bash(gh pr create:*),Bash(gh pr close:*),Bash(gh pr edit:*)"
             --allowedTools "Read,Glob,Grep,LS,Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(cat:*),Bash(ls:*),Bash(grep:*),Bash(rg:*),Bash(sort:*),Bash(uniq:*),Bash(cut:*),Bash(find:*),Bash(diff:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh run view:*),Bash(gh run list:*),Bash(gh pr review:*),Bash(gh pr comment:*),Bash(gh api repos/*/pulls/*/comments),mcp__github_inline_comment__create_inline_comment${{ steps.gate.outputs.merge_allowed == 'true' && ',Bash(gh pr merge:*)' || '' }}"
