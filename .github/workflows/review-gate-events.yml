@@ -1,0 +1,21 @@
+name: Review Gate Events
+run-name: 'Review gate event for PR #${{ github.event.pull_request.number }}'
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+
+# This observer receives fork events with no write token and runs no PR code.
+# Its completion refreshes the privileged default-branch metadata gate.
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Signal a trusted metadata refresh
+        run: "true"
+

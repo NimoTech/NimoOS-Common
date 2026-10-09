@@ -1,0 +1,5 @@
+# Changes to review automation require a named maintainer.
+/.github/workflows/ @wiwiwilliam @leihaowen
+/.github/scripts/ @wiwiwilliam @leihaowen
+/.github/CODEOWNERS @wiwiwilliam @leihaowen
+/AGENTS.md @wiwiwilliam @leihaowen

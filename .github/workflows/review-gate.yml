@@ -1,0 +1,198 @@
+# Deployment prerequisite: allow GitHub Actions to create and approve pull requests
+# at organization and target-repository level; keep default token permissions read-only.
+name: Review Merge Gate
+on:
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review, reopened, converted_to_draft, labeled, unlabeled, edited, closed]
+  workflow_run:
+    workflows: [Review Gate Events]
+    types: [completed]
+  issue_comment:
+    types: [created, edited, deleted]
+  push:
+    branches: [main]
+    paths: ['.github/scripts/**', '.github/workflows/review-gate*.yml', 'AGENTS.md']
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+  checks: write
+  statuses: write
+jobs:
+  gate:
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request &&
+       (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' ||
+        github.event.comment.user.login == 'claude[bot]' ||
+        ((github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'COLLABORATOR') &&
+         (contains(github.event.comment.body, '@codex') ||
+          contains(github.event.comment.body, '@claude') ||
+          contains(github.event.changes.body.from, '@codex') ||
+          contains(github.event.changes.body.from, '@claude')))))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: nimo-review-merge-gate
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Block previous verdicts before checkout or tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYTHON'
+          import datetime, json, os, re, urllib.request
+          repo = os.environ["GITHUB_REPOSITORY"]
+          with open(os.environ["GITHUB_EVENT_PATH"]) as f:
+              event = json.load(f)
+          default = event["repository"]["default_branch"]
+          def call(path, method="GET", payload=None):
+              req = urllib.request.Request("https://api.github.com/" + path, method=method,
+                  data=json.dumps(payload).encode() if payload is not None else None,
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                           "Accept": "application/vnd.github+json", "Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=25) as response:
+                  return json.load(response)
+          heads = set()
+          all_pulls = []
+          for page in range(1, 101):
+              pulls = call(f"repos/{repo}/pulls?state=open&per_page=100&page={page}")
+              all_pulls.extend(pulls)
+              heads.update(p["head"]["sha"] for p in pulls if p["base"]["ref"] == default)
+              if len(pulls) < 100:
+                  break
+          else:
+              raise RuntimeError("Open PR pagination exceeded the safe bound")
+          errors = []
+          trigger = event.get("pull_request", {}).get("number") or event.get("issue", {}).get("number")
+          run = event.get("workflow_run", {})
+          if not trigger and run.get("pull_requests"):
+              triggered_numbers = {p["number"] for p in run["pull_requests"]}
+          else:
+              title = re.fullmatch(r"Review gate event for PR #(\d+)", run.get("display_title", ""))
+              if not trigger and title:
+                  trigger = int(title.group(1))
+              triggered_numbers = {trigger} if trigger else set()
+          affected = {p["head"]["sha"] for p in all_pulls
+                      if p["base"]["ref"] == default and p["number"] in triggered_numbers}
+          # A PR-specific event must not consume every other PR's finite status
+          # history. Global policy updates/manual refreshes still invalidate all.
+          if not triggered_numbers:
+              affected = heads
+          for sha in sorted(affected):
+              status_blocked = False
+              try:
+                  history = []
+                  for page in range(1, 101):
+                      batch = call(f"repos/{repo}/commits/{sha}/statuses?per_page=100&page={page}")
+                      history.extend(s for s in batch if s.get("context", "").lower() == "nimo review approval")
+                      if len(batch) < 100:
+                          break
+                  else:
+                      raise RuntimeError("Status pagination exceeded the safe bound")
+                  exhausted = len(history) >= 900
+                  wanted = "failure" if exhausted else "pending"
+                  latest = history[0] if history else None
+                  if not (latest and latest.get("state") == wanted
+                          and latest.get("creator", {}).get("id") == 41898282
+                          and latest.get("creator", {}).get("login") == "github-actions[bot]"):
+                      pending = call(f"repos/{repo}/statuses/{sha}", "POST", {
+                          "context": "Nimo Review Approval", "state": wanted,
+                          "description": "Push a new commit: status history is near its limit." if exhausted else
+                              "Review evidence is being checked before loading the gate."})
+                      if (pending.get("creator", {}).get("id") != 41898282
+                              or pending.get("creator", {}).get("login") != "github-actions[bot]"):
+                          raise RuntimeError("Unexpected status publisher")
+                  status_blocked = True
+                  if exhausted:
+                      raise RuntimeError("Status history is near its limit; a new commit is required")
+                  check = call(f"repos/{repo}/check-runs", "POST", {
+                      "name": "Nimo Review Gate", "head_sha": sha,
+                      "external_id": "nimo-review-gate:" + sha, "status": "in_progress",
+                      "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                      "output": {"title": "Evaluating trusted reviews",
+                                 "summary": "Review evidence is being checked before loading the gate."}})
+                  if check.get("app", {}).get("id") != 15368:
+                      raise RuntimeError("Unexpected check publisher")
+              except Exception as error:
+                  errors.append(sha)
+                  print(sha[:12], "blocking check failed:", type(error).__name__)
+                  # A failed history read does not prove that publishing a
+                  # required failure also fails. Try that independent fallback.
+                  if not status_blocked:
+                      try:
+                          blocked = call(f"repos/{repo}/statuses/{sha}", "POST", {
+                              "context": "Nimo Review Approval", "state": "failure",
+                              "description": "Fresh review verification could not start."})
+                          if (blocked.get("creator", {}).get("id") != 41898282
+                                  or blocked.get("creator", {}).get("login") != "github-actions[bot]"):
+                              raise RuntimeError("Unexpected status publisher")
+                      except Exception as fallback:
+                          print(sha[:12], "required status invalidation failed:", type(fallback).__name__)
+                  try:
+                      checks = call(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=all")["check_runs"]
+                      own = [c for c in checks if c["name"] == "Nimo Review Gate"
+                             and c.get("app", {}).get("id") == 15368
+                             and c.get("external_id") == "nimo-review-gate:" + sha]
+                      for check in own:
+                          call(f"repos/{repo}/check-runs/{check['id']}", "PATCH", {
+                              "status": "completed", "conclusion": "failure",
+                              "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                              "output": {"title": "Merge blocked", "summary": "Fresh review verification could not start."}})
+                  except Exception as fallback:
+                      print(sha[:12], "fallback invalidation failed:", type(fallback).__name__)
+                  # Revoke our PR-specific approval independently of status publication.
+                  for pull in all_pulls:
+                      if pull["head"]["sha"] != sha or pull["base"]["ref"] != default:
+                          continue
+                      try:
+                          number = pull["number"]
+                          reviews = []
+                          for page in range(1, 101):
+                              batch = call(f"repos/{repo}/pulls/{number}/reviews?per_page=100&page={page}")
+                              reviews.extend(batch)
+                              if len(batch) < 100:
+                                  break
+                          else:
+                              raise RuntimeError("Review pagination exceeded the safe bound")
+                          for review in reviews:
+                              managed = (review.get("user", {}).get("id") == 41898282
+                                      and review.get("user", {}).get("login") == "github-actions[bot]"
+                                      and (review.get("body") or "").startswith("<!-- nimo-review-gate-approval -->"))
+                              native = (review.get("user", {}).get("type") == "Bot"
+                                        and review.get("user", {}).get("login") in
+                                            {"chatgpt-codex-connector[bot]", "claude[bot]"})
+                              if review["state"] == "APPROVED" and (managed or native):
+                                  dismissed = call(f"repos/{repo}/pulls/{number}/reviews/{review['id']}/dismissals", "PUT", {
+                                      "message": "审查检查无法初始化，等待重新核对最新提交。"})
+                                  if dismissed.get("state") != "DISMISSED":
+                                      raise RuntimeError("Bridge approval was not revoked")
+                      except Exception as fallback:
+                          print(sha[:12], "approval revocation failed:", type(fallback).__name__)
+          # Isolate bad commit groups. Healthy groups must reach the publisher.
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write("NIMO_GATE_BOOTSTRAP_HEADS=" + json.dumps(sorted(heads)) + "\n")
+              env.write("NIMO_GATE_BOOTSTRAP_FAILURES=" + json.dumps(errors) + "\n")
+          if errors:
+              print("::warning::Blocked " + str(len(errors)) + " failed commit groups; continuing healthy groups")
+          PYTHON
+      - name: Read trusted default-branch gate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            .github/workflows/review-gate.yml
+          sparse-checkout-cone-mode: false
+      - name: Verify gate policy
+        run: python3 -m unittest discover -s .github/scripts -p test_review_gate.py -q
+      - name: Publish current-commit review gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/review_gate.py
+
