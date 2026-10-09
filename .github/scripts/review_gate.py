@@ -22,6 +22,14 @@ BRIDGE_MARKER = "<!-- nimo-review-gate-approval -->"
 TICK = chr(96)
 
 
+class SupersededEvaluation(RuntimeError):
+    """A newer trusted invalidation owns this commit verdict."""
+
+
+class UncertainEpoch(SupersededEvaluation):
+    """Timestamp precision cannot establish ownership of a reused commit."""
+
+
 def stamp(value):
     return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() if value else 0
 
@@ -132,8 +140,10 @@ def decision(pr, reviews, comments, threads, reactions=()):
     native_comments = [c for c in comments if bot(c["user"], CODEX)
                        and c.get("verified_commit_id") == sha
                        and reviewed_commit(c.get("body"), sha)]
-    if any(priority(r.get("body")) in {0, 1} for r in native_reviews + native_comments):
-        return "failure", "Codex reported a P0/P1 finding on the current commit."
+    blocking_reviews = [r for r in reviews if bot(r["user"]) and r["commit_id"] == sha
+                        and r["state"] != "DISMISSED"]
+    if any(priority(r.get("body")) in {0, 1} for r in blocking_reviews + native_comments):
+        return "failure", "Codex/Claude reported a P0/P1 finding on the current commit."
 
     for review in latest.values():
         if (bot(review["user"], CLAUDE) and review["state"] == "APPROVED"
@@ -241,13 +251,72 @@ class GitHub:
                 return results
         raise RuntimeError("Pagination exceeded the safe bound; gate remains blocked.")
 
-    def status(self, sha, state):
-        history = [s for s in self.pages(f"repos/{self.repo}/commits/{sha}/statuses")
-                   if s.get("context", "").lower() == STATUS_NAME.lower()]
+    def status_history(self, sha):
+        return [s for s in self.pages(f"repos/{self.repo}/commits/{sha}/statuses")
+                if s.get("context", "").lower() == STATUS_NAME.lower()]
+
+    @staticmethod
+    def epoch_marker(history):
+        trusted = [s for s in history if s.get("creator", {}).get("id") == BRIDGE_ID
+                   and s.get("creator", {}).get("login") == BRIDGE]
+        # Compensation only revokes its own generation. It must not republish
+        # a cached competing marker: another invalidation may already own SHA.
+        revoked = {match.group(1) for s in trusted if (match := re.match(
+            r"^Review superseded epoch ([0-9]+\.[0-9]+):", s.get("description") or ""))}
+        return next((s for s in trusted if (match := re.match(
+            r"^Review epoch ([0-9]+\.[0-9]+):", s.get("description") or ""))
+            and match.group(1) not in revoked), None)
+
+    def assert_current_epoch(self, sha, history=None, initialize=False):
+        epoch = os.environ.get("NIMO_GATE_EPOCH")
+        if not epoch:
+            return
+        marker = self.epoch_marker(history if history is not None else self.status_history(sha))
+        if marker is None:
+            if initialize:
+                return
+            raise RuntimeError("The trusted event generation has not been initialized.")
+        actual = re.match(r"^Review epoch ([0-9]+\.[0-9]+):", marker["description"]).group(1)
+        if actual != epoch:
+            if initialize:
+                # Run IDs do not order invalidations: rerunning an old run can
+                # publish a newer marker. Only take over markers definitely
+                # published before the trusted bootstrap began its snapshot.
+                started = stamp(os.environ.get("NIMO_GATE_BOOTSTRAP_STARTED_AT"))
+                created = stamp(marker.get("created_at"))
+                if started and created and created < int(started):
+                    return
+                if not started or not created or int(created) == int(started):
+                    raise UncertainEpoch("Cannot order the existing marker against this bootstrap.")
+            raise SupersededEvaluation("Another event owns this commit verdict.")
+
+    def status(self, sha, state, initialize=False):
+        history = self.status_history(sha)
+        try:
+            self.assert_current_epoch(sha, history, initialize=initialize)
+        except UncertainEpoch:
+            # Do not claim the other epoch or leave an ambiguous old green.
+            # A description without a marker preserves the authoritative
+            # generation in history, including invalidations racing this POST.
+            latest = history[0] if history else None
+            if (not latest or latest.get("state") == "success"
+                    or latest.get("creator", {}).get("id") != BRIDGE_ID
+                    or latest.get("creator", {}).get("login") != BRIDGE):
+                blocked = self.call(f"repos/{self.repo}/statuses/{sha}", "POST", {
+                    "context": STATUS_NAME, "state": "pending",
+                    "description": "Epoch order uncertain; awaiting a fresh trusted event."})
+                if (blocked.get("creator", {}).get("id") != BRIDGE_ID
+                        or blocked.get("creator", {}).get("login") != BRIDGE
+                        or blocked.get("state") != "pending" or blocked.get("context") != STATUS_NAME):
+                    raise RuntimeError("Ambiguous epoch could not be blocked.")
+            raise
         latest = history[0] if history else None
         exhausted = len(history) >= STATUS_HISTORY_LIMIT
         requested = "failure" if exhausted else state
         if (latest and latest.get("state") == requested
+                and (not initialize or not os.environ.get("NIMO_GATE_EPOCH")
+                     or (self.epoch_marker(history) and self.epoch_marker(history)["description"].startswith(
+                         "Review epoch " + os.environ["NIMO_GATE_EPOCH"] + ":")))
                 and latest.get("creator", {}).get("login") == BRIDGE
                 and latest.get("creator", {}).get("id") == BRIDGE_ID):
             if exhausted:
@@ -257,6 +326,8 @@ class GitHub:
         description = {"pending": "Awaiting current-commit trusted review",
                        "success": "Current-commit review policy passed",
                        "failure": "Current-commit review policy prevents merging"}[state]
+        if initialize and os.environ.get("NIMO_GATE_EPOCH"):
+            description = "Review epoch " + os.environ["NIMO_GATE_EPOCH"] + ": initializing new head"
         published = self.call(f"repos/{self.repo}/statuses/{sha}", "POST", {
             "context": STATUS_NAME, "state": state, "description": description,
             "target_url": os.environ["GITHUB_SERVER_URL"] + "/" + self.repo
@@ -265,6 +336,37 @@ class GitHub:
         if (creator.get("login") != BRIDGE or creator.get("id") != BRIDGE_ID
                 or published.get("state") != state or published.get("context") != STATUS_NAME):
             raise RuntimeError("Commit status publisher or verdict did not match the gate.")
+        if os.environ.get("NIMO_GATE_EPOCH"):
+            try:
+                after = self.status_history(sha)
+                if initialize:
+                    # Our initialization marker must not hide an invalidation
+                    # published between the preflight history read and POST.
+                    before = {(s.get("id"), s.get("description"), s.get("created_at")) for s in history}
+                    for candidate in after:
+                        marker = self.epoch_marker([candidate])
+                        if (marker and not marker["description"].startswith("Review epoch " + os.environ["NIMO_GATE_EPOCH"] + ":")
+                                and (marker.get("id"), marker.get("description"), marker.get("created_at")) not in before):
+                            raise SupersededEvaluation("Another invalidation raced head initialization.")
+                self.assert_current_epoch(sha, after)
+            except SupersededEvaluation:
+                # Revoke our own marker, including an initialization that hid
+                # the competing marker. Never reassert a cached other epoch:
+                # a third invalidation may have arrived after the history read.
+                revoked = self.call(f"repos/{self.repo}/statuses/{sha}", "POST", {
+                    "context": STATUS_NAME, "state": "pending",
+                    "description": "Review superseded epoch " + os.environ["NIMO_GATE_EPOCH"] + ": newer invalidation owns this head."})
+                if (revoked.get("creator", {}).get("id") != BRIDGE_ID
+                        or revoked.get("creator", {}).get("login") != BRIDGE
+                        or revoked.get("state") != "pending" or revoked.get("context") != STATUS_NAME):
+                    raise RuntimeError("Superseded generation could not be revoked.")
+                raise
+            except Exception:
+                # A green write is never accepted without the post-write check.
+                self.call(f"repos/{self.repo}/statuses/{sha}", "POST", {
+                    "context": STATUS_NAME, "state": "failure",
+                    "description": "Event-generation verification failed after publication."})
+                raise
         if exhausted:
             raise RuntimeError("Status history is near GitHub's limit; push a new commit before reviewing again.")
 
@@ -328,6 +430,8 @@ class GitHub:
     def sync_approval(self, pr, state, reason):
         """Bind the validated outcome to this PR's formal approval requirement."""
         n, sha = pr["number"], pr["head"]["sha"]
+        if state == "success":
+            self.assert_current_epoch(sha)
         reviews = self.pages(f"repos/{self.repo}/pulls/{n}/reviews")
         own = [r for r in reviews if bridge_review(r)]
         latest = opinions(own).get(BRIDGE)
@@ -375,7 +479,8 @@ class GitHub:
         # must also invalidate any status left from an earlier use of that SHA.
         known = os.environ.get("NIMO_GATE_BOOTSTRAP_HEADS")
         if known is not None and sha not in json.loads(known):
-            self.status(sha, "pending")
+            self.status(sha, "pending", initialize=True)
+        self.assert_current_epoch(sha)
         self.check_heads = getattr(self, "check_heads", {})
         external = "nimo-review-gate:" + sha
         try:
@@ -460,6 +565,13 @@ def run():
     api = GitHub()
     default = event["repository"]["default_branch"]
     pulls = [p for p in api.pages(f"repos/{api.repo}/pulls?state=open") if p["base"]["ref"] == default]
+    # A PR-specific publisher must not overwrite a different PR's newer
+    # invalidation. Only policy updates/manual global refreshes evaluate all.
+    scoped_numbers = set(json.loads(os.environ.get("NIMO_GATE_BOOTSTRAP_NUMBERS", "[]")))
+    if scoped_numbers:
+        scoped_heads = {p["head"]["sha"] for p in pulls if p["number"] in scoped_numbers}
+        scoped_heads.update(json.loads(os.environ.get("NIMO_GATE_BOOTSTRAP_AFFECTED_HEADS", "[]")))
+        pulls = [p for p in pulls if p["head"]["sha"] in scoped_heads]
     # Refresh every PR so a later queued run also catches evidence changes
     # for PRs already processed by an earlier run.
     groups = {}
@@ -479,6 +591,9 @@ def run():
             continue
         try:
             prepared.append((sha, cohort, api.check(sha)))
+        except SupersededEvaluation:
+            print(sha[:12], "superseded event skipped; newer invalidation remains authoritative.")
+            continue
         except Exception as error:
             errors.append(sha)
             for item in cohort:
@@ -543,6 +658,9 @@ def run():
             reason = "\n\n".join(text for _, text in outcomes)
             api.publish(check_id, state, reason + "\n\nReviewed head: " + sha)
             print(sha[:12], state, reason)
+        except SupersededEvaluation:
+            print(sha[:12], "superseded event skipped; newer invalidation remains authoritative.")
+            continue
         except Exception as error:
             errors.append(sha)
             for item in cohort:

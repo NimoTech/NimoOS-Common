@@ -19,8 +19,10 @@ permissions:
   issues: read
   checks: write
   statuses: write
+env:
+  NIMO_GATE_EPOCH: ${{ github.run_id }}.${{ github.run_attempt }}
 jobs:
-  gate:
+  invalidate:
     if: >-
       github.event_name != 'issue_comment' ||
       (github.event.issue.pull_request &&
@@ -35,17 +37,22 @@ jobs:
           contains(github.event.changes.body.from, '@claude')))))
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    concurrency:
-      group: nimo-review-merge-gate
-      cancel-in-progress: false
-      queue: max
+    outputs:
+      heads: ${{ steps.invalidate.outputs.heads }}
+      failures: ${{ steps.invalidate.outputs.failures }}
+      numbers: ${{ steps.invalidate.outputs.numbers }}
+      affected_heads: ${{ steps.invalidate.outputs.affected_heads }}
+      epoch: ${{ steps.invalidate.outputs.epoch }}
+      started_at: ${{ steps.invalidate.outputs.started_at }}
     steps:
-      - name: Block previous verdicts before checkout or tests
+      - name: Block previous verdicts before the publisher queue
+        id: invalidate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PYTHON'
           import datetime, json, os, re, urllib.request
+          started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
           repo = os.environ["GITHUB_REPOSITORY"]
           with open(os.environ["GITHUB_EVENT_PATH"]) as f:
               event = json.load(f)
@@ -79,6 +86,10 @@ jobs:
               triggered_numbers = {trigger} if trigger else set()
           affected = {p["head"]["sha"] for p in all_pulls
                       if p["base"]["ref"] == default and p["number"] in triggered_numbers}
+          closed_head = event.get("pull_request", {}).get("head", {}).get("sha")
+          if closed_head:
+              affected.update(p["head"]["sha"] for p in all_pulls
+                              if p["base"]["ref"] == default and p["head"]["sha"] == closed_head)
           # A PR-specific event must not consume every other PR's finite status
           # history. Global policy updates/manual refreshes still invalidate all.
           if not triggered_numbers:
@@ -97,13 +108,17 @@ jobs:
                   exhausted = len(history) >= 900
                   wanted = "failure" if exhausted else "pending"
                   latest = history[0] if history else None
+                  epoch = os.environ.get("NIMO_GATE_EPOCH")
+                  marker = "Review epoch " + epoch + ": " if epoch else ""
                   if not (latest and latest.get("state") == wanted
+                          and (not epoch or (latest.get("description") or "").startswith(marker))
                           and latest.get("creator", {}).get("id") == 41898282
                           and latest.get("creator", {}).get("login") == "github-actions[bot]"):
                       pending = call(f"repos/{repo}/statuses/{sha}", "POST", {
                           "context": "Nimo Review Approval", "state": wanted,
-                          "description": "Push a new commit: status history is near its limit." if exhausted else
-                              "Review evidence is being checked before loading the gate."})
+                          "description": marker + ("Push a new commit: status history is near its limit." if exhausted else
+                              "Review evidence is being checked before loading the gate."),
+                          "target_url": "https://github.com/" + repo + "/actions/runs/" + os.environ.get("GITHUB_RUN_ID", "0")})
                       if (pending.get("creator", {}).get("id") != 41898282
                               or pending.get("creator", {}).get("login") != "github-actions[bot]"):
                           raise RuntimeError("Unexpected status publisher")
@@ -127,10 +142,11 @@ jobs:
                       try:
                           blocked = call(f"repos/{repo}/statuses/{sha}", "POST", {
                               "context": "Nimo Review Approval", "state": "failure",
-                              "description": "Fresh review verification could not start."})
+                              "description": ("Review epoch " + os.environ["NIMO_GATE_EPOCH"] + ": " if os.environ.get("NIMO_GATE_EPOCH") else "") + "Fresh review verification could not start."})
                           if (blocked.get("creator", {}).get("id") != 41898282
                                   or blocked.get("creator", {}).get("login") != "github-actions[bot]"):
                               raise RuntimeError("Unexpected status publisher")
+                          status_blocked = True
                       except Exception as fallback:
                           print(sha[:12], "required status invalidation failed:", type(fallback).__name__)
                   try:
@@ -166,7 +182,7 @@ jobs:
                               native = (review.get("user", {}).get("type") == "Bot"
                                         and review.get("user", {}).get("login") in
                                             {"chatgpt-codex-connector[bot]", "claude[bot]"})
-                              if review["state"] == "APPROVED" and (managed or native):
+                              if review["state"] == "APPROVED" and (managed or (native and not status_blocked)):
                                   dismissed = call(f"repos/{repo}/pulls/{number}/reviews/{review['id']}/dismissals", "PUT", {
                                       "message": "审查检查无法初始化，等待重新核对最新提交。"})
                                   if dismissed.get("state") != "DISMISSED":
@@ -175,11 +191,38 @@ jobs:
                           print(sha[:12], "approval revocation failed:", type(fallback).__name__)
           # Isolate bad commit groups. Healthy groups must reach the publisher.
           with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write("NIMO_GATE_BOOTSTRAP_STARTED_AT=" + started_at + "\n")
               env.write("NIMO_GATE_BOOTSTRAP_HEADS=" + json.dumps(sorted(heads)) + "\n")
               env.write("NIMO_GATE_BOOTSTRAP_FAILURES=" + json.dumps(errors) + "\n")
+              env.write("NIMO_GATE_BOOTSTRAP_NUMBERS=" + json.dumps(sorted(triggered_numbers)) + "\n")
+              env.write("NIMO_GATE_BOOTSTRAP_AFFECTED_HEADS=" + json.dumps(sorted(affected)) + "\n")
+          if os.environ.get("GITHUB_OUTPUT"):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write("epoch=" + os.environ.get("NIMO_GATE_EPOCH", "") + "\n")
+                  output.write("started_at=" + started_at + "\n")
+                  output.write("heads=" + json.dumps(sorted(heads)) + "\n")
+                  output.write("failures=" + json.dumps(errors) + "\n")
+                  output.write("numbers=" + json.dumps(sorted(triggered_numbers)) + "\n")
+                  output.write("affected_heads=" + json.dumps(sorted(affected)) + "\n")
           if errors:
               print("::warning::Blocked " + str(len(errors)) + " failed commit groups; continuing healthy groups")
           PYTHON
+  gate:
+    needs: invalidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: nimo-review-merge-gate
+      cancel-in-progress: false
+      queue: max
+    env:
+      NIMO_GATE_EPOCH: ${{ needs.invalidate.outputs.epoch }}
+      NIMO_GATE_BOOTSTRAP_STARTED_AT: ${{ needs.invalidate.outputs.started_at }}
+      NIMO_GATE_BOOTSTRAP_HEADS: ${{ needs.invalidate.outputs.heads }}
+      NIMO_GATE_BOOTSTRAP_FAILURES: ${{ needs.invalidate.outputs.failures }}
+      NIMO_GATE_BOOTSTRAP_NUMBERS: ${{ needs.invalidate.outputs.numbers }}
+      NIMO_GATE_BOOTSTRAP_AFFECTED_HEADS: ${{ needs.invalidate.outputs.affected_heads }}
+    steps:
       - name: Read trusted default-branch gate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -190,7 +233,11 @@ jobs:
             .github/workflows/review-gate.yml
           sparse-checkout-cone-mode: false
       - name: Verify gate policy
-        run: python3 -m unittest discover -s .github/scripts -p test_review_gate.py -q
+        run: >-
+          env -u NIMO_GATE_EPOCH -u NIMO_GATE_BOOTSTRAP_STARTED_AT -u NIMO_GATE_BOOTSTRAP_HEADS
+          -u NIMO_GATE_BOOTSTRAP_FAILURES -u NIMO_GATE_BOOTSTRAP_NUMBERS
+          -u NIMO_GATE_BOOTSTRAP_AFFECTED_HEADS -u GITHUB_OUTPUT
+          python3 -m unittest discover -s .github/scripts -p test_review_gate.py -q
       - name: Publish current-commit review gate
         env:
           GH_TOKEN: ${{ github.token }}

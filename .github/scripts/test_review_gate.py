@@ -614,15 +614,17 @@ class WorkflowBootstrapTests(unittest.TestCase):
                 return io.BytesIO(json.dumps({"state": payload["state"], "context": payload["context"], "creator": {"id": 41898282, "login": "github-actions[bot]"}}).encode())
             if req.method == "POST" and payload["head_sha"] == fail_sha: raise RuntimeError("Check unavailable")
             return io.BytesIO(json.dumps({"app": {"id": 15368}}).encode())
-        with tempfile.NamedTemporaryFile(mode="w") as f, tempfile.NamedTemporaryFile(mode="w+") as env_file:
+        with tempfile.NamedTemporaryFile(mode="w") as f, tempfile.NamedTemporaryFile(mode="w+") as env_file, tempfile.NamedTemporaryFile(mode="w+") as output_file:
             json.dump(event or {"repository": {"default_branch": "main"}}, f);f.flush()
-            env = {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_EVENT_PATH": f.name, "GH_TOKEN": "test", "GITHUB_ENV": env_file.name}
+            env = {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_EVENT_PATH": f.name, "GH_TOKEN": "test", "GITHUB_ENV": env_file.name, "GITHUB_OUTPUT": output_file.name}
             with patch.dict(os.environ, env), patch("urllib.request.urlopen", side_effect=urlopen):
                 error = None
                 try: exec(compile(script, "trusted-bootstrap", "exec"), {})
                 except RuntimeError as caught: error = caught
             env_file.seek(0)
             self.bootstrap_environment = dict(line.rstrip().split("=", 1) for line in env_file)
+            output_file.seek(0)
+            self.bootstrap_outputs = dict(line.rstrip().split("=", 1) for line in output_file)
         return calls, error
 
     def test_before_checkout_bootstrap_blocks_all_default_branch_heads(self):
@@ -847,7 +849,7 @@ class BootstrapScopeRegressionTests(unittest.TestCase):
         from unittest.mock import patch
         api=GitHub.__new__(GitHub);api.repo="owner/repo"
         calls=[]
-        api.status=lambda sha,state:calls.append(("status",sha,state))
+        api.status=lambda sha,state,**kwargs:calls.append(("status",sha,state))
         api.pages=lambda *args:[]
         api.call=lambda *args:{"id":1,"app":{"id":15368}}
         with patch.dict(os.environ,{"NIMO_GATE_BOOTSTRAP_HEADS":"[]","GITHUB_SERVER_URL":"https://github.com","GITHUB_RUN_ID":"1"}):api.check(SHA)
@@ -931,12 +933,12 @@ class ReviewRoundAndFailureRegressionTests(unittest.TestCase):
         changed=pr();changed["head"]["sha"]="f"*40
         self.assertNotEqual(decision(changed,[earlier,later],clean(),[])[0],"success")
 
-    def test_history_read_failure_still_invalidates_required_status_and_all_robot_approvals(self):
+    def test_history_read_failure_invalidates_status_and_managed_approval_only(self):
         case=WorkflowBootstrapTests()
         calls,error=case.bootstrap([pr()],history_failure=True,native_approval=True)
         self.assertIsNone(error)
         self.assertTrue(any(c.get("context")=="Nimo Review Approval" and c.get("state")=="failure" for c in calls))
-        self.assertEqual(len([c for c in calls if "message" in c]),2)
+        self.assertEqual(len([c for c in calls if "message" in c]),1)
 
     def test_gate_uses_supported_multi_pending_queue(self):
         from pathlib import Path
@@ -945,3 +947,334 @@ class ReviewRoundAndFailureRegressionTests(unittest.TestCase):
         workflow=next(p for p in candidates if p.exists()).read_text()
         self.assertIn("queue: max",workflow)
         self.assertIn("cancel-in-progress: false",workflow)
+
+
+class FinalBodyAndQueueTests(unittest.TestCase):
+    def test_claude_comment_review_p1_blocks_previous_formal_approval(self):
+        earlier=review(CLAUDE)
+        later=review(CLAUDE,"COMMENTED",id=2)
+        later.update(body="[P1] Current commit blocker",submitted_at="2026-10-08T10:00:01Z")
+        self.assertEqual(decision(pr(),[earlier,later],[],[])[0],"failure")
+
+    def test_claude_p2_comment_review_preserves_valid_formal_approval(self):
+        later=review(CLAUDE,"COMMENTED",id=2);later["body"]="[P2] Optional improvement"
+        self.assertEqual(decision(pr(),[review(CLAUDE),later],[],[])[0],"success")
+
+    def test_check_failure_preserves_native_approval_when_required_status_is_blocked(self):
+        calls,error=WorkflowBootstrapTests().bootstrap([pr()],fail_sha=SHA,native_approval=True)
+        self.assertIsNone(error)
+        self.assertEqual(len([c for c in calls if "message" in c]),1)
+        self.assertTrue(any(c.get("context")=="Nimo Review Approval" and c.get("state")=="pending" for c in calls))
+
+    def test_invalidation_runs_outside_serial_publisher_queue(self):
+        from pathlib import Path
+        base=Path(__file__).resolve().parent
+        candidates=[base/"review-gate.yml",base.parent/"workflows/review-gate.yml"]
+        workflow=next(p for p in candidates if p.exists()).read_text()
+        invalidation,publisher=workflow.split("  gate:\n",1)
+        self.assertNotIn("concurrency:",invalidation)
+        self.assertIn("Block previous verdicts before the publisher queue",invalidation)
+        self.assertIn("needs: invalidate",publisher)
+        self.assertIn("queue: max",publisher)
+        self.assertIn("needs.invalidate.outputs.failures",publisher)
+
+
+class ScopedPublisherRegressionTests(unittest.TestCase):
+    def test_pr_specific_publisher_does_not_write_unrelated_pr_verdict(self):
+        import os,json,tempfile
+        from unittest.mock import patch
+        from review_gate import run
+        a,b=pr(),pr();b.update(number=2,head={"sha":"b"*40});a["updated_at"]=b["updated_at"]=TIME
+        writes=[]
+        class API:
+            repo="owner/repo"
+            def pages(self,path):return [a,b]
+            def check(self,sha):return 2
+            def call(self,path):return copy.deepcopy(b)
+            def evidence(self,n):
+                cs=copy.deepcopy(clean())
+                for c in cs:c["verified_commit_id"]=b["head"]["sha"];c["body"]=c["body"].replace(SHA[:10],"b"*10).replace(SHA[:7],"b"*7)
+                return {"reviews":[],"comments":cs,"threads":[]}
+            def sync_approval(self,p,state,reason):writes.append(("approval",p["number"],state))
+            def publish(self,c,state,reason):writes.append(("status",c,state))
+        with tempfile.NamedTemporaryFile(mode="w") as f:
+            json.dump({"repository":{"default_branch":"main"}},f);f.flush()
+            with patch.dict(os.environ,{"GITHUB_EVENT_NAME":"push","GITHUB_EVENT_PATH":f.name,"NIMO_GATE_BOOTSTRAP_NUMBERS":json.dumps([2]),"NIMO_GATE_BOOTSTRAP_FAILURES":"[]"}),patch("review_gate.GitHub",return_value=API()):
+                run()
+        self.assertIn(("status",2,"success"),writes)
+        self.assertFalse(any(number==1 for kind,number,state in writes))
+
+
+
+class EpochAndSharedCommitRegressionTests(unittest.TestCase):
+    def cohort_run(self, held=False, closed=False):
+        import os,json,tempfile
+        from unittest.mock import patch
+        from review_gate import run
+        a,b=pr(),pr();b["number"]=2
+        a["updated_at"]=b["updated_at"]=TIME
+        if held:b["labels"]=[{"name":"hold"}]
+        pulls=[b] if closed else [a,b]
+        writes=[]
+        class API:
+            repo="owner/repo"
+            def pages(self,path):return pulls
+            def check(self,sha):return 1
+            def call(self,path):return copy.deepcopy(b if path.endswith("/2") else a)
+            def evidence(self,n):return {"reviews":[],"comments":clean(),"threads":[]}
+            def sync_approval(self,p,state,reason):writes.append(("approval",p["number"],state))
+            def publish(self,c,state,reason):writes.append(("status",c,state))
+        with tempfile.NamedTemporaryFile(mode="w") as f:
+            json.dump({"repository":{"default_branch":"main"}},f);f.flush()
+            env={"GITHUB_EVENT_NAME":"push","GITHUB_EVENT_PATH":f.name,
+                 "NIMO_GATE_BOOTSTRAP_NUMBERS":"[1]","NIMO_GATE_BOOTSTRAP_AFFECTED_HEADS":json.dumps([SHA]),
+                 "NIMO_GATE_BOOTSTRAP_FAILURES":"[]"}
+            with patch.dict(os.environ,env),patch("review_gate.GitHub",return_value=API()):run()
+        return writes
+
+    def test_scoped_publisher_keeps_shared_sha_hold_in_cohort(self):
+        writes=self.cohort_run(held=True)
+        self.assertIn(("approval",2,"failure"),writes)
+        self.assertIn(("status",1,"failure"),writes)
+        self.assertNotIn(("status",1,"success"),writes)
+
+    def test_closed_trigger_still_refreshes_remaining_shared_sha_pr(self):
+        writes=self.cohort_run(closed=True)
+        self.assertIn(("approval",2,"success"),writes)
+        self.assertIn(("status",1,"success"),writes)
+
+    def test_closed_pr_bootstrap_exports_remaining_shared_sha(self):
+        import json
+        b=pr();b["number"]=2
+        case=WorkflowBootstrapTests()
+        calls,error=case.bootstrap([b],event={"repository":{"default_branch":"main"},"pull_request":{"number":1,"head":{"sha":SHA}}})
+        self.assertIsNone(error)
+        self.assertEqual(json.loads(case.bootstrap_environment["NIMO_GATE_BOOTSTRAP_AFFECTED_HEADS"]),[SHA])
+        self.assertTrue(any(c.get("context")=="Nimo Review Approval" and c.get("state")=="pending" for c in calls))
+
+    def marker(self,epoch):
+        from review_gate import BRIDGE,BRIDGE_ID,STATUS_NAME
+        return {"context":STATUS_NAME,"state":"pending","description":"Review epoch "+epoch+": verifying evidence",
+                "creator":{"login":BRIDGE,"id":BRIDGE_ID},"target_url":"https://github.com/owner/repo/actions/runs/"+epoch.split(".")[0]}
+
+    def test_older_publisher_cannot_replace_new_generation(self):
+        import os
+        from unittest.mock import patch
+        from review_gate import SupersededEvaluation
+        api=GitHub.__new__(GitHub);api.repo="owner/repo";api.pages=lambda path:[self.marker("200.1")]
+        api.call=lambda *args:self.fail("Superseded evaluation must not publish")
+        with patch.dict(os.environ,{"NIMO_GATE_EPOCH":"100.1"}):
+            with self.assertRaises(SupersededEvaluation):api.status(SHA,"success")
+
+    def test_older_generation_cannot_create_formal_approval(self):
+        import os
+        from unittest.mock import patch
+        from review_gate import SupersededEvaluation
+        api=GitHub.__new__(GitHub);api.repo="owner/repo";api.pages=lambda path:[self.marker("200.1")]
+        api.call=lambda *args:self.fail("Superseded evaluation must not approve")
+        with patch.dict(os.environ,{"NIMO_GATE_EPOCH":"100.1"}):
+            with self.assertRaises(SupersededEvaluation):api.sync_approval(pr(),"success","Codex completed review")
+
+    def test_invalidation_between_preflight_and_post_is_restored(self):
+        import os
+        from unittest.mock import patch
+        from review_gate import SupersededEvaluation,BRIDGE,BRIDGE_ID,STATUS_NAME
+        api=GitHub.__new__(GitHub);api.repo="owner/repo";calls=[]
+        older=self.marker("100.1");newer=self.marker("200.1")
+        stale_green={**older,"state":"success","description":"Current-commit review policy passed"}
+        histories=iter([[older],[stale_green,newer,older]])
+        api.pages=lambda path:next(histories)
+        def call(path,method,payload):
+            calls.append(payload)
+            return {**payload,"creator":{"login":BRIDGE,"id":BRIDGE_ID}}
+        api.call=call
+        with patch.dict(os.environ,{"NIMO_GATE_EPOCH":"100.1","GITHUB_SERVER_URL":"https://github.com","GITHUB_RUN_ID":"100"}):
+            with self.assertRaises(SupersededEvaluation):api.status(SHA,"success")
+        self.assertEqual([p["state"] for p in calls],["success","pending"])
+        self.assertTrue(calls[-1]["description"].startswith("Review superseded epoch 100.1:"))
+        self.assertEqual(api.epoch_marker([{**calls[-1], "creator": {"login": BRIDGE, "id": BRIDGE_ID}}, newer, older]), newer)
+
+    def test_failed_post_write_verification_replaces_green_with_failure(self):
+        import os
+        from unittest.mock import patch
+        from review_gate import BRIDGE,BRIDGE_ID
+        api=GitHub.__new__(GitHub);api.repo="owner/repo";calls=[]
+        api.pages=__import__("unittest.mock",fromlist=["Mock"]).Mock(side_effect=[[self.marker("100.1")],RuntimeError("read failed")])
+        def call(path,method,payload):
+            calls.append(payload);return {**payload,"creator":{"login":BRIDGE,"id":BRIDGE_ID}}
+        api.call=call
+        with patch.dict(os.environ,{"NIMO_GATE_EPOCH":"100.1","GITHUB_SERVER_URL":"https://github.com","GITHUB_RUN_ID":"100"}):
+            with self.assertRaises(RuntimeError):api.status(SHA,"success")
+        self.assertEqual([p["state"] for p in calls],["success","failure"])
+
+    def test_new_bootstrap_generation_replaces_older_pending_marker(self):
+        import os
+        from unittest.mock import patch
+        case=WorkflowBootstrapTests()
+        with patch.dict(os.environ,{"NIMO_GATE_EPOCH":"200.1","GITHUB_RUN_ID":"200"}):
+            calls,error=case.bootstrap([pr()],statuses=[self.marker("100.1")])
+        self.assertIsNone(error)
+        marks=[p for p in calls if p.get("context")=="Nimo Review Approval"]
+        self.assertEqual(len(marks),1)
+        self.assertTrue(marks[0]["description"].startswith("Review epoch 200.1:"))
+
+
+class DynamicEpochInitializationTests(unittest.TestCase):
+    def test_new_head_with_legacy_pending_still_receives_generation_marker(self):
+        import os
+        from unittest.mock import patch
+        from review_gate import BRIDGE,BRIDGE_ID,STATUS_NAME
+        api=GitHub.__new__(GitHub);api.repo="owner/repo";calls=[]
+        legacy={"context":STATUS_NAME,"state":"pending","creator":{"login":BRIDGE,"id":BRIDGE_ID}}
+        marker=EpochAndSharedCommitRegressionTests().marker("100.1")
+        histories=iter([[legacy],[marker,legacy]])
+        api.pages=lambda path:next(histories)
+        def call(path,method,payload):
+            calls.append(payload);return {**payload,"creator":{"login":BRIDGE,"id":BRIDGE_ID}}
+        api.call=call
+        with patch.dict(os.environ,{"NIMO_GATE_EPOCH":"100.1","GITHUB_SERVER_URL":"https://github.com","GITHUB_RUN_ID":"100"}):api.status(SHA,"pending",initialize=True)
+        self.assertEqual(len(calls),1)
+        self.assertTrue(calls[0]["description"].startswith("Review epoch 100.1:"))
+
+    def initialization_api(self, old_epoch="99.1", created_at="2026-10-08T10:00:00Z", old_state="success"):
+        from review_gate import BRIDGE, BRIDGE_ID, STATUS_NAME
+        api = GitHub.__new__(GitHub); api.repo = "owner/repo"
+        marker = {**EpochAndSharedCommitRegressionTests().marker(old_epoch), "id": 1, "created_at": created_at}
+        history = [{"id": 2, "context": STATUS_NAME, "state": old_state,
+                    "description": "Current-commit review policy passed",
+                    "creator": {"login": BRIDGE, "id": BRIDGE_ID}}, marker]
+        calls = []
+        api.pages = lambda path, *args: list(history) if "/statuses" in path else []
+        def call(path, method="GET", payload=None):
+            calls.append((path, payload))
+            result = {**(payload or {}), "id": 10 + len(calls), "created_at": "2026-10-08T11:00:01Z",
+                      "creator": {"login": BRIDGE, "id": BRIDGE_ID}, "app": {"id": 15368}}
+            if "/statuses/" in path: history.insert(0, result)
+            return result
+        api.call = call
+        return api, calls, history
+
+    def initialization_env(self):
+        return {"NIMO_GATE_EPOCH": "100.1", "NIMO_GATE_BOOTSTRAP_STARTED_AT": "2026-10-08T11:00:00.500000+00:00",
+                "NIMO_GATE_BOOTSTRAP_HEADS": "[]", "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "100"}
+
+    def test_reused_sha_old_green_is_invalidated_before_creating_check(self):
+        import os
+        from unittest.mock import patch
+        api, calls, history = self.initialization_api()
+        with patch.dict(os.environ, self.initialization_env()): api.check(SHA)
+        self.assertEqual(calls[0][1]["state"], "pending")
+        self.assertTrue(calls[0][1]["description"].startswith("Review epoch 100.1:"))
+        self.assertIn("check-runs", calls[1][0])
+        self.assertEqual(history[0]["state"], "pending")
+
+    def test_older_pending_epoch_is_replaced_not_reused(self):
+        import os
+        from unittest.mock import patch
+        api, calls, _ = self.initialization_api(old_state="pending")
+        with patch.dict(os.environ, self.initialization_env()): api.status(SHA, "pending", initialize=True)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][1]["description"].startswith("Review epoch 100.1:"))
+
+    def test_lower_run_id_with_newer_invalidation_is_not_taken_over(self):
+        import os
+        from unittest.mock import patch
+        from review_gate import SupersededEvaluation
+        api, calls, _ = self.initialization_api(old_epoch="50.2", created_at="2026-10-08T11:00:01Z")
+        with patch.dict(os.environ, self.initialization_env()):
+            with self.assertRaises(SupersededEvaluation): api.check(SHA)
+        self.assertEqual(calls, [])
+
+    def test_same_second_marker_blocks_green_without_claiming_epoch(self):
+        import os
+        from unittest.mock import patch
+        from review_gate import SupersededEvaluation
+        api, calls, history = self.initialization_api(created_at="2026-10-08T11:00:00Z")
+        with patch.dict(os.environ, self.initialization_env()):
+            with self.assertRaises(SupersededEvaluation): api.check(SHA)
+        self.assertEqual([p["state"] for _, p in calls], ["pending"])
+        self.assertNotIn("Review epoch", calls[0][1]["description"])
+        self.assertEqual(api.epoch_marker(history)["description"].split(":")[0], "Review epoch 99.1")
+
+    def test_missing_marker_time_cannot_leave_old_green(self):
+        import os
+        from unittest.mock import patch
+        from review_gate import SupersededEvaluation
+        api, calls, _ = self.initialization_api(created_at=None)
+        with patch.dict(os.environ, self.initialization_env()):
+            with self.assertRaises(SupersededEvaluation): api.check(SHA)
+        self.assertEqual([p["state"] for _, p in calls], ["pending"])
+
+    def test_invalidation_racing_initialization_is_not_hidden_by_own_marker(self):
+        import os
+        from unittest.mock import patch
+        from review_gate import SupersededEvaluation
+        api, calls, history = self.initialization_api()
+        call = api.call
+        newer = {**EpochAndSharedCommitRegressionTests().marker("101.1"), "id": 20, "created_at": "2026-10-08T11:00:01Z"}
+        def racing_call(path, method="GET", payload=None):
+            if not calls: history.insert(0, newer)
+            return call(path, method, payload)
+        api.call = racing_call
+        with patch.dict(os.environ, self.initialization_env()):
+            with self.assertRaises(SupersededEvaluation): api.check(SHA)
+        self.assertEqual([p["state"] for _, p in calls], ["pending", "pending"])
+        self.assertTrue(calls[-1][1]["description"].startswith("Review superseded epoch 100.1:"))
+        self.assertEqual(api.epoch_marker(history)["id"], newer["id"])
+
+    def test_partial_rerun_uses_successful_invalidation_epoch_and_start(self):
+        import os, pathlib, re
+        from unittest.mock import patch
+        case = WorkflowBootstrapTests()
+        with patch.dict(os.environ, {"NIMO_GATE_EPOCH": "100.1", "GITHUB_RUN_ID": "100"}):
+            _, error = case.bootstrap([pr()])
+        self.assertIsNone(error)
+        self.assertEqual(case.bootstrap_outputs["epoch"], "100.1")
+        self.assertEqual(case.bootstrap_outputs["started_at"], case.bootstrap_environment["NIMO_GATE_BOOTSTRAP_STARTED_AT"])
+        base = pathlib.Path(__file__).resolve().parent
+        workflow = next(p for p in [base/"review-gate.yml", base.parent/"workflows/review-gate.yml"] if p.exists()).read_text()
+        publisher = workflow.split("  gate:\n", 1)[1]
+        mapped = {key: case.bootstrap_outputs[out] for key, out in re.findall(
+            r"^      (NIMO_GATE_[A-Z_]+): \$\{\{ needs.invalidate.outputs.([a-z_]+) \}\}", publisher, re.M)}
+        api, calls, _ = self.initialization_api(old_epoch="100.1")
+        # On rerun github.run_attempt is 2, but invalidate was not rerun.
+        with patch.dict(os.environ, {"NIMO_GATE_EPOCH": "100.2", **mapped}): api.assert_current_epoch(SHA)
+        self.assertEqual(calls, [])
+
+    def third_generation_race(self, initialize):
+        import os
+        from unittest.mock import patch
+        from review_gate import SupersededEvaluation
+        api, calls, history = self.initialization_api(old_epoch="100.1", created_at="2026-10-08T10:00:00Z")
+        if initialize:
+            history[-1]["description"] = "Review epoch 99.1: previous use of SHA"
+        else:
+            history[0]["state"] = "pending"
+        call = api.call
+        second = {**EpochAndSharedCommitRegressionTests().marker("50.2"), "id": 20, "created_at": "2026-10-08T11:00:01Z"}
+        third = {**EpochAndSharedCommitRegressionTests().marker("25.3"), "id": 30, "created_at": "2026-10-08T11:00:02Z"}
+        def racing_call(path, method="GET", payload=None):
+            # B invalidates after A's preflight. C invalidates after A reads B
+            # but just before A writes its compensating pending status.
+            if len(calls) == 0: history.insert(0, second)
+            if len(calls) == 1: history.insert(0, third)
+            return call(path, method, payload)
+        api.call = racing_call
+        with patch.dict(os.environ, self.initialization_env()):
+            with self.assertRaises(SupersededEvaluation):
+                api.status(SHA, "pending" if initialize else "success", initialize=initialize)
+        self.assertEqual(history[0]["state"], "pending")
+        self.assertTrue(history[0]["description"].startswith("Review superseded epoch 100.1:"))
+        self.assertEqual(api.epoch_marker(history)["id"], third["id"])
+        with patch.dict(os.environ, {**self.initialization_env(), "NIMO_GATE_EPOCH": "50.2"}):
+            with self.assertRaises(SupersededEvaluation): api.status(SHA, "success")
+        # C remains authoritative even though its run ID is the smallest.
+        with patch.dict(os.environ, {**self.initialization_env(), "NIMO_GATE_EPOCH": "25.3"}):
+            api.assert_current_epoch(SHA)
+        self.assertEqual(len(calls), 2)
+
+    def test_third_invalidation_survives_cached_normal_compensation(self):
+        self.third_generation_race(initialize=False)
+
+    def test_third_invalidation_survives_hidden_initialization_compensation(self):
+        self.third_generation_race(initialize=True)
