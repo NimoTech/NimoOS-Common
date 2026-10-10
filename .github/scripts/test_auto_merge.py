@@ -23,11 +23,17 @@ class FakeGitHub:
         self.calls, self.reads, self.race, self.superseded = [], 0, None, False
         self.files = [{"filename": "README.md"}]
         self.ci = False
+        self.base_tip = "b" * 40
 
     finish_followup = MergeGitHub.finish_followup
 
     def candidate_verified(self, pr):
+        pr["_candidate_base"] = self.base_tip
         return True
+
+    def final_snapshot(self, number):
+        return {**self.call(f"repos/{self.repo}/pulls/{number}"),
+                "base_tip": self.base_tip, "labels_complete": True}
 
     def verify_candidate_workflow(self, ref):
         self.candidate_ref = ref
@@ -532,7 +538,8 @@ class AutoMergeTests(unittest.TestCase):
             self.assertEqual(os.environ["NIMO_GATE_EPOCH"], "123.1")
             raise RuntimeError("retry")
         with patch.dict(os.environ, {"NIMO_GATE_BOOTSTRAP_NUMBERS": "[1]", "NIMO_GATE_EPOCH": "123.1"}), \
-             patch("auto_merge.refresh_review_gate", side_effect=refresh):
+             patch("auto_merge.refresh_review_gate", side_effect=refresh), \
+             patch.object(api, "assert_checkout_policy_current"):
             with self.assertRaises(RuntimeError):
                 api.refresh_gate()
             self.assertEqual(os.environ["NIMO_GATE_BOOTSTRAP_NUMBERS"], "[1]")
@@ -585,7 +592,8 @@ class AutoMergeTests(unittest.TestCase):
                                      "NIMO_GATE_BOOTSTRAP_NUMBERS": "[1]", "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "123"}), \
              patch.object(gate, "status", side_effect=initialize), patch.object(gate, "assert_current_epoch", side_effect=assert_owner), \
              patch.object(gate, "pages", return_value=[]), patch.object(gate, "call", return_value={"id": 1, "app": {"id": 15368}}), \
-             patch("auto_merge.refresh_review_gate", side_effect=refresh):
+             patch("auto_merge.refresh_review_gate", side_effect=refresh), \
+             patch.object(api, "assert_checkout_policy_current"):
             api.refresh_gate()
         self.assertEqual(set(owners.values()), {"123.1"})
 
@@ -647,6 +655,172 @@ class AutoMergeTests(unittest.TestCase):
         with patch.object(self.api, "candidate_verified", side_effect=[True, False]):
             self.assertEqual(self.worker.sync(self.api.pr), "waiting_for_candidate_policy_tests")
         self.assertFalse(any(c[0].endswith("/merge") for c in self.api.calls))
+
+
+    def test_base_tip_advance_after_successful_policy_proof_prevents_merge(self):
+        self.api.files = [{"filename": ".github/scripts/review_gate.py"}]
+        original = self.api.candidate_verified
+        calls = 0
+        def verify(pr):
+            nonlocal calls
+            calls += 1
+            verified = original(pr)
+            if calls == 2:
+                self.api.base_tip = "c" * 40
+            return verified
+        with patch.object(self.api, "candidate_verified", side_effect=verify):
+            self.assertEqual(self.worker.sync(self.api.pr), "waiting_for_candidate_policy_tests")
+        self.assertFalse(any(c[0].endswith("/merge") for c in self.api.calls))
+
+    def test_failed_candidate_proof_still_revokes_new_native_request(self):
+        for failed_call in [1, 2]:
+            with self.subTest(failed_call=failed_call):
+                api = FakeGitHub()
+                api.files = [{"filename": ".github/scripts/review_gate.py"}]
+                original = api.candidate_verified
+                calls = 0
+                def verify(pr):
+                    nonlocal calls
+                    calls += 1
+                    if calls == failed_call:
+                        api.pr["auto_merge"] = {"merge_method": "squash"}
+                        return False
+                    return original(pr)
+                with patch.object(api, "candidate_verified", side_effect=verify):
+                    self.assertEqual(AutoMerge(api, "main").sync(api.pr), "changed")
+                self.assertIsNone(api.pr["auto_merge"])
+                self.assertFalse(any(c[0].endswith("/merge") for c in api.calls))
+
+    def test_graphql_final_snapshot_uses_live_base_and_rejects_partial_labels(self):
+        api = MergeGitHub.__new__(MergeGitHub);api.repo = "owner/repo"
+        row = {"id": "PR_test", "state": "OPEN", "isDraft": False,
+               "headRefOid": SHA, "baseRefName": "main", "updatedAt": self.api.pr["updated_at"],
+               "labels": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+               "autoMergeRequest": {"mergeMethod": "SQUASH"}, "baseRef": {"target": {"oid": "c" * 40}}}
+        response = {"data": {"repository": {"pullRequest": row}}}
+        with patch.object(api, "call", return_value=response) as call:
+            snapshot = api.final_snapshot(1)
+            self.assertEqual(snapshot["base_tip"], "c" * 40)
+            self.assertEqual(snapshot["auto_merge"], {"mergeMethod": "SQUASH"})
+            self.assertTrue(eligible(snapshot, "main"))
+            row["labels"]["pageInfo"]["hasNextPage"] = True
+            partial = api.final_snapshot(1)
+            self.assertFalse(eligible(partial, "main"))
+            with patch.object(self.api, "final_snapshot", return_value={**partial, "auto_merge": None}):
+                self.assertEqual(self.worker.sync(self.api.pr), "changed")
+        self.assertFalse(any(c[0].endswith("/merge") for c in self.api.calls))
+
+    def test_lost_merge_response_immediately_runs_confirmed_merge_followups(self):
+        self.api.files = [{"filename": "AGENTS.md"}]
+        self.api.ci = True
+        original = self.api.call
+        def lost(path, method="GET", payload=None):
+            if path.endswith("/merge"):
+                self.api.pr["merged"] = True
+                self.api.pr["state"] = "closed"
+                raise TimeoutError("Successful server response lost")
+            return original(path, method, payload)
+        with patch.object(self.api, "call", side_effect=lost):
+            self.assertEqual(self.worker.sync(self.api.pr), "merged_policy_refreshed")
+        self.assertIn(("dispatch_ci", "POST", {"ref": "main"}), self.api.calls)
+        self.assertIn(("dispatch", "POST", {"ref": "main"}), self.api.calls)
+        self.assertEqual(self.worker.recovery_needed, set())
+
+    def test_unconfirmed_merge_recovery_dispatch_is_bounded(self):
+        for attempt in [0, 3]:
+            with self.subTest(attempt=attempt):
+                api = FakeGitHub();api.files = [{"filename": "AGENTS.md"}]
+                original = api.call
+                def uncertain(path, method="GET", payload=None):
+                    if path.endswith("/merge"):
+                        raise TimeoutError("Server result unavailable")
+                    return original(path, method, payload)
+                with tempfile.NamedTemporaryFile(mode="w+") as f:
+                    json.dump({"repository": {"default_branch": "main"}, "inputs": {"auto_merge_retry": str(attempt)}}, f);f.flush()
+                    with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name, "NIMO_GATE_BOOTSTRAP_NUMBERS": "[1]"}), \
+                         patch("auto_merge.MergeGitHub", return_value=api), patch.object(api, "call", side_effect=uncertain), \
+                         patch("auto_merge.time.sleep"):
+                        with self.assertRaises(RuntimeError):
+                            run()
+                retries = [c for c in api.calls if c[0] == "retry"]
+                self.assertEqual(len(retries), int(attempt == 0))
+                if retries:
+                    self.assertEqual(retries[0][2], {"attempt": 1, "numbers": [1]})
+
+    def test_definitive_merge_rejection_does_not_schedule_ambiguous_recovery(self):
+        import urllib.error
+        for code in [403, 405, 409]:
+            with self.subTest(code=code):
+                api = FakeGitHub();api.files = [{"filename": "AGENTS.md"}]
+                worker = AutoMerge(api, "main")
+                original = api.call
+                def refused(path, method="GET", payload=None):
+                    if path.endswith("/merge"):
+                        raise urllib.error.HTTPError("test", code, "refused", {}, None)
+                    return original(path, method, payload)
+                with patch.object(api, "call", side_effect=refused):
+                    with self.assertRaises(urllib.error.HTTPError):
+                        worker.sync(api.pr)
+                self.assertEqual(worker.recovery_needed, set())
+                self.assertFalse(any(c[0] in {"dispatch", "dispatch_ci"} for c in api.calls))
+
+    def test_policy_refresh_preserves_original_epoch_boundary(self):
+        from review_gate import GitHub
+        api = MergeGitHub.__new__(MergeGitHub)
+        gate = GitHub.__new__(GitHub)
+        marker = {"creator": {"id": BRIDGE_ID, "login": BRIDGE},
+                  "description": "Review epoch 124.1: new event", "created_at": "2026-10-10T04:01:00Z"}
+        def refresh():
+            self.assertEqual(os.environ["NIMO_GATE_BOOTSTRAP_STARTED_AT"], "2026-10-10T04:00:00Z")
+            gate.assert_current_epoch(SHA, history=[marker], initialize=True)
+        with patch.dict(os.environ, {"NIMO_GATE_EPOCH": "123.1", "NIMO_GATE_BOOTSTRAP_STARTED_AT": "2026-10-10T04:00:00Z"}), \
+             patch.object(api, "assert_checkout_policy_current"), patch("auto_merge.refresh_review_gate", side_effect=refresh):
+            with self.assertRaises(SupersededEvaluation):
+                api.refresh_gate()
+        self.assertFalse(getattr(api, "recovered_policy", False))
+
+    def test_policy_refresh_allows_business_main_advance_but_stops_policy_change(self):
+        api = MergeGitHub.__new__(MergeGitHub);api.repo = "owner/repo"
+        checkout, main = "b" * 40, "c" * 40
+        github_tree = ["same"]
+        def call(path, *args, **kwargs):
+            if path == "repos/owner/repo":
+                return {"default_branch": "main"}
+            if "/git/ref/" in path:
+                return {"object": {"sha": main}}
+            return {"tree": [{"path": ".github", "type": "tree", "sha": github_tree[0] if path.endswith(main) else "same"},
+                             {"path": "AGENTS.md", "type": "blob", "sha": "same-rules"}]}
+        with patch("auto_merge.subprocess.check_output", return_value=checkout), patch.object(api, "call", side_effect=call), \
+             patch("auto_merge.refresh_review_gate") as refresh:
+            api.refresh_gate()
+            self.assertTrue(api.recovered_policy)
+            api.recovered_policy = False
+            github_tree[0] = "new-policy"
+            with self.assertRaises(SupersededEvaluation):
+                api.refresh_gate()
+            self.assertFalse(api.recovered_policy)
+            self.assertEqual(refresh.call_count, 1)
+            github_tree[0] = "same"
+            refresh.side_effect = lambda: github_tree.__setitem__(0, "new-policy")
+            with self.assertRaises(SupersededEvaluation):
+                api.refresh_gate()
+            self.assertFalse(api.recovered_policy)
+
+    def test_successful_global_policy_recovery_removes_old_pr_scope(self):
+        api = FakeGitHub()
+        api.recovered_policy = True
+        original = api.call
+        def other_pr(path, method="GET", payload=None):
+            if path == "repos/owner/repo/pulls/2" and method == "GET":
+                return {**copy.deepcopy(api.pr), "number": 2}
+            return original(path, method, payload)
+        with tempfile.NamedTemporaryFile(mode="w+") as f:
+            json.dump({"repository": {"default_branch": "main"}}, f);f.flush()
+            with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name, "NIMO_GATE_BOOTSTRAP_NUMBERS": "[1]"}), \
+                 patch("auto_merge.MergeGitHub", return_value=api), patch.object(api, "call", side_effect=other_pr):
+                run()
+        merged = [c[0] for c in api.calls if c[0].endswith("/merge")]
+        self.assertEqual(merged, ["repos/owner/repo/pulls/1/merge", "repos/owner/repo/pulls/2/merge"])
 
 if __name__ == "__main__":
     unittest.main()

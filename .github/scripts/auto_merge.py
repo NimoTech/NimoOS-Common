@@ -6,6 +6,7 @@ import os
 import time
 import base64
 import re
+import subprocess
 import yaml
 from contextlib import contextmanager
 import urllib.error
@@ -81,6 +82,7 @@ class MergeGitHub(GitHub):
             raise RuntimeError("Candidate policy tests must retain their trusted identity and read-only permissions")
 
     def candidate_verified(self, pr):
+        pr.pop("_candidate_base", None)
         # Metadata comes from the attested read-only pull_request workflow, never a
         # check name supplied by candidate code. Candidate tests run on a separate
         # read-only runner, with no write token, secrets or persisted credentials.
@@ -91,7 +93,7 @@ class MergeGitHub(GitHub):
         if comparison.get("status") not in {"ahead", "identical"}:
             return False
         path = ".github/workflows/review-policy-tests.yml"
-        main_source = self.call(f"repos/{self.repo}/contents/{path}?ref=" + urllib.parse.quote(pr["base"]["ref"], safe=""))
+        main_source = self.call(f"repos/{self.repo}/contents/{path}?ref=" + base)
         candidate_source = self.call(f"repos/{self.repo}/contents/{path}?ref=" + pr["head"]["sha"])
         if main_source["sha"] != candidate_source["sha"]:
             # A modified test runner cannot attest itself. Its own maintenance
@@ -110,11 +112,45 @@ class MergeGitHub(GitHub):
             return False
         jobs = self.pages(f"repos/{self.repo}/actions/runs/{latest['id']}/attempts/{latest.get('run_attempt', 1)}/jobs", key="jobs")
         candidates = [job for job in jobs if job.get("name") == "candidate"]
-        return (len(candidates) == 1 and candidates[0].get("status") == "completed"
+        verified = (len(candidates) == 1 and candidates[0].get("status") == "completed"
                 and candidates[0].get("conclusion") == "success"
                 and any(step.get("name") == "Test candidate policy without privileged credentials"
                         and step.get("status") == "completed" and step.get("conclusion") == "success"
                         for step in candidates[0].get("steps", [])))
+        if verified:
+            pr["_candidate_base"] = base
+        return verified
+
+    def final_snapshot(self, number):
+        # REST pullRequest.base.sha is a stored PR value, not the live branch
+        # tip. Observe metadata and the actual base ref together after the
+        # candidate's network requests; neither observation is a merge lock.
+        owner, name = self.repo.split("/")
+        query = """query($owner:String!,$name:String!,$number:Int!) {
+          repository(owner:$owner,name:$name) {
+            pullRequest(number:$number) {
+              id state isDraft headRefOid baseRefName updatedAt
+              labels(first:100) {nodes {name} pageInfo {hasNextPage}}
+              autoMergeRequest {mergeMethod}
+              baseRef {target {oid}}
+            }
+          }
+        }"""
+        result = self.call("graphql", "POST", {"query": query,
+            "variables": {"owner": owner, "name": name, "number": number}})
+        if result.get("errors"):
+            raise RuntimeError("Cannot observe final merge snapshot: " + str(result["errors"]))
+        row = result["data"]["repository"]["pullRequest"]
+        if not row:
+            return {"number": number, "state": "closed"}
+        labels = row["labels"]
+        return {"number": number, "node_id": row["id"],
+            "state": "open" if row["state"] == "OPEN" else "closed", "draft": row["isDraft"],
+            "head": {"sha": row["headRefOid"]}, "base": {"ref": row["baseRefName"]},
+            "updated_at": row["updatedAt"], "labels": labels["nodes"],
+            "labels_complete": not labels["pageInfo"]["hasNextPage"],
+            "auto_merge": row["autoMergeRequest"],
+            "base_tip": ((row.get("baseRef") or {}).get("target") or {}).get("oid")}
 
     def followup(self, pr, state, description):
         return self.call(f"repos/{self.repo}/statuses/{pr['head']['sha']}", "POST", {
@@ -175,10 +211,26 @@ class MergeGitHub(GitHub):
         if failures:
             raise RuntimeError("Merged PR followups still pending: " + str(failures))
 
+    def assert_checkout_policy_current(self):
+        checkout = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        default = self.call(f"repos/{self.repo}")["default_branch"]
+        main = self.call(f"repos/{self.repo}/git/ref/heads/" + urllib.parse.quote(default, safe=""))["object"]["sha"]
+        if checkout == main:
+            return
+        def policy(sha):
+            tree = self.call(f"repos/{self.repo}/git/trees/{sha}")
+            if tree.get("truncated"):
+                raise RuntimeError("Cannot verify complete trusted policy tree")
+            return {entry["path"]: (entry["type"], entry["sha"])
+                    for entry in tree["tree"] if entry["path"] in {"AGENTS.md", ".github"}}
+        if policy(checkout) != policy(main):
+            raise SupersededEvaluation("Default-branch policy changed after trusted checkout")
+
     def refresh_gate(self):
         # This process was checked out from the current trusted default branch.
         # Recover policy refresh in-place rather than dispatching another gate:
         # a persistent CI/HTTP failure must never create a self-sustaining run chain.
+        self.assert_checkout_policy_current()
         names = [k for k in os.environ if k.startswith("NIMO_GATE_BOOTSTRAP_")]
         previous = {k: os.environ.pop(k) for k in names}
         # An empty known-head snapshot makes GitHub.check initialize every
@@ -186,9 +238,12 @@ class MergeGitHub(GitHub):
         # Clearing the PR filter alone would skip heads owned by older epochs.
         os.environ["NIMO_GATE_BOOTSTRAP_HEADS"] = "[]"
         os.environ["NIMO_GATE_BOOTSTRAP_NUMBERS"] = "[]"
-        os.environ["NIMO_GATE_BOOTSTRAP_STARTED_AT"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        os.environ["NIMO_GATE_BOOTSTRAP_STARTED_AT"] = previous.get(
+            "NIMO_GATE_BOOTSTRAP_STARTED_AT", datetime.datetime.now(datetime.timezone.utc).isoformat())
         try:
             refresh_review_gate()
+            self.assert_checkout_policy_current()
+            self.recovered_policy = True
         finally:
             for key in list(os.environ):
                 if key.startswith("NIMO_GATE_BOOTSTRAP_"):
@@ -239,12 +294,14 @@ class MergeGitHub(GitHub):
 
 def eligible(pr, default):
     return (pr.get("state") == "open" and not pr.get("draft")
+            and pr.get("labels_complete", True)
             and pr.get("base", {}).get("ref") == default
             and not any(label["name"].lower() == "hold" for label in pr.get("labels", [])))
 
 
 def unchanged(before, after):
     return (after.get("state") == "open"
+            and after.get("labels_complete", True)
             and before["head"]["sha"] == after["head"]["sha"]
             and before["base"]["ref"] == after["base"]["ref"]
             and before.get("draft") == after.get("draft")
@@ -258,6 +315,7 @@ class AutoMerge:
         self.api, self.default = api, default
         self.policy_merged = False
         self.retry_needed = set()
+        self.recovery_needed = set()
 
     def graphql(self, query, variables):
         response = self.api.call("graphql", "POST", {"query": query, "variables": variables})
@@ -345,6 +403,12 @@ class AutoMerge:
             # before this rollout inherits CI from the current default branch.
             has_ci = self.api.has_ci(sha if ci_changed else self.default)
             if policy_changed and not self.api.candidate_verified(pr):
+                final = self.api.final_snapshot(n)
+                if final.get("auto_merge"):
+                    self.disable(final)
+                    return "changed"
+                if not unchanged(pr, final) or not eligible(final, self.default):
+                    return "changed"
                 return "waiting_for_candidate_policy_tests"
             if ".github/workflows/review-policy-tests.yml" in paths:
                 self.api.verify_candidate_workflow(sha)
@@ -365,23 +429,43 @@ class AutoMerge:
             state, _ = checked_decision(self.api, current)
             if state != "success":
                 return "waiting_for_valid_review"
-            if policy_changed and not self.api.candidate_verified(current):
-                return "waiting_for_candidate_policy_tests"
-            self.api.assert_current_epoch(sha)
-            final = self.api.call(f"repos/{self.api.repo}/pulls/{n}")
+            candidate_ok = not policy_changed or self.api.candidate_verified(current)
+            if candidate_ok:
+                self.api.assert_current_epoch(sha)
+            final = self.api.final_snapshot(n)
             if final.get("auto_merge"):
                 self.disable(final)
                 return "changed"
             if not unchanged(current, final) or not eligible(final, self.default):
                 return "changed"
+            if not candidate_ok or (policy_changed and
+                    current.get("_candidate_base") != final.get("base_tip")):
+                return "waiting_for_candidate_policy_tests"
             # The GitHub API binds this PUT to the head SHA and native branch
             # rules. Labels/custom evidence have no atomic compare-and-merge
             # API: this is the final observed snapshot, not a transactional lock
             # against edits arriving after this read. Never grant this bot bypass.
             if policy_changed:
                 self.policy_merged = True  # Also stop on a lost/ambiguous merge response.
-            result = self.api.call(f"repos/{self.api.repo}/pulls/{n}/merge", "PUT", {
-                "sha": sha, "merge_method": "squash"})
+            try:
+                result = self.api.call(f"repos/{self.api.repo}/pulls/{n}/merge", "PUT", {
+                    "sha": sha, "merge_method": "squash"})
+            except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as error:
+                # A definitive rejection is not an ambiguous successful merge.
+                if isinstance(error, urllib.error.HTTPError) and error.code < 500:
+                    raise
+                try:
+                    observed = self.api.call(f"repos/{self.api.repo}/pulls/{n}")
+                except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError):
+                    observed = None
+                if (observed and observed.get("merged")
+                        and observed.get("head", {}).get("sha") == sha):
+                    result = {"merged": True}
+                else:
+                    # No push/closed event is guaranteed for GITHUB_TOKEN merges.
+                    # A bounded dispatch runs durable recovery before PR filtering.
+                    self.recovery_needed.add(n)
+                    raise
             if not result.get("merged"):
                 raise RuntimeError("GitHub did not complete the protected squash merge.")
             if policy_changed:
@@ -409,6 +493,8 @@ def run():
     pulls = api.pages(f"repos/{api.repo}/pulls?state=open")
     numbers = set(json.loads(os.environ.get("NIMO_GATE_BOOTSTRAP_NUMBERS", "[]")))
     heads = set(json.loads(os.environ.get("NIMO_GATE_BOOTSTRAP_AFFECTED_HEADS", "[]")))
+    if getattr(api, "recovered_policy", False):
+        numbers, heads = set(), set()
     if numbers:
         pulls = [p for p in pulls if p["number"] in numbers or p["head"]["sha"] in heads]
     worker, failures = AutoMerge(api, default), []
@@ -425,13 +511,14 @@ def run():
         if worker.policy_merged:
             print("Review policy changed; remaining PRs await a new default-branch evaluation.")
             break
-    if worker.retry_needed and not worker.policy_merged:
+    retry_numbers = worker.recovery_needed or (worker.retry_needed if not worker.policy_merged else set())
+    if retry_numbers:
         retry = int(event.get("inputs", {}).get("auto_merge_retry", "0"))
         if retry not in range(4):
             raise RuntimeError("Invalid mergeability retry count")
         if retry < 3:
             time.sleep(10)
-            api.dispatch_retry(default, retry + 1, worker.retry_needed)
+            api.dispatch_retry(default, retry + 1, retry_numbers)
         else:
             raise RuntimeError("GitHub mergeability remains unknown after bounded retries; rerun this workflow.")
     if failures:
