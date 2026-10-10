@@ -1,0 +1,38 @@
+name: Review Policy Tests
+run-name: 'Candidate review policy for PR #${{ github.event.pull_request.number }} at ${{ github.event.pull_request.head.sha }}'
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened, edited]
+    paths: ['.github/scripts/**', '.github/workflows/**', '.github/CODEOWNERS', 'AGENTS.md']
+permissions:
+  contents: read
+jobs:
+  candidate:
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read candidate policy on this separate read-only runner
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+          sparse-checkout: .github
+      - name: Install pinned parser on this read-only runner
+        run: >-
+          python3 -m pip install --quiet --disable-pip-version-check --only-binary=:all: --require-hashes -r candidate/.github/scripts/review-requirements.txt
+      - name: Require policy entry points and tests
+        run: |
+          for file in review_gate.py test_review_gate.py auto_merge.py test_auto_merge.py; do
+            test -f "candidate/.github/scripts/$file"
+          done
+      - name: Test candidate policy without privileged credentials
+        run: >-
+          env -u GH_TOKEN -u GITHUB_TOKEN -u NIMO_GATE_EPOCH
+          -u NIMO_GATE_BOOTSTRAP_STARTED_AT -u NIMO_GATE_BOOTSTRAP_HEADS
+          -u NIMO_GATE_BOOTSTRAP_FAILURES -u NIMO_GATE_BOOTSTRAP_NUMBERS
+          -u NIMO_GATE_BOOTSTRAP_AFFECTED_HEADS -u GITHUB_OUTPUT
+          python3 -m unittest discover -s candidate/.github/scripts -p 'test_*.py' -q

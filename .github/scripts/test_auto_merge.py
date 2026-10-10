@@ -26,6 +26,18 @@ class FakeGitHub:
 
     finish_followup = MergeGitHub.finish_followup
 
+    def candidate_verified(self, pr):
+        return True
+
+    def verify_candidate_workflow(self, ref):
+        self.candidate_ref = ref
+
+    def verify_bridge(self, ref):
+        self.bridge_ref = ref
+
+    def refresh_gate(self):
+        self.calls.append(("refresh", "POST", None))
+
     def verify_gate(self, ref):
         self.gate_ref = ref
 
@@ -35,8 +47,8 @@ class FakeGitHub:
     def recover_followups(self, default):
         pass
 
-    def dispatch_retry(self, default, attempt):
-        self.calls.append(("retry", "POST", {"attempt": attempt}))
+    def dispatch_retry(self, default, attempt, numbers):
+        self.calls.append(("retry", "POST", {"attempt": attempt, "numbers": sorted(numbers)}))
 
     def dispatch_workflow(self, workflow, default):
         (self.dispatch_gate if workflow == "review-gate.yml" else self.dispatch_ci)(default)
@@ -48,7 +60,7 @@ class FakeGitHub:
     def dispatch_ci(self, default):
         self.calls.append(("dispatch_ci", "POST", {"ref": default}))
 
-    def pages(self, path):
+    def pages(self, path, **kwargs):
         if path.endswith("/files"):
             return copy.deepcopy(self.files)
         if path == "repos/owner/repo/pulls?state=open":
@@ -264,7 +276,7 @@ class AutoMergeTests(unittest.TestCase):
     def test_ci_edits_are_validated_from_candidate_head(self):
         self.api.files = [{"filename": ".github/workflows/ci.yml"}]
         self.api.ci = True
-        self.assertEqual(self.worker.sync(self.api.pr), "merged")
+        self.assertEqual(self.worker.sync(self.api.pr), "merged_policy_refreshed")
         self.assertEqual(self.api.ci_ref, SHA)
 
     def test_older_business_branch_inherits_current_main_ci(self):
@@ -272,7 +284,7 @@ class AutoMergeTests(unittest.TestCase):
         self.assertEqual(self.api.ci_ref, "main")
 
     def test_business_merge_does_not_dispatch_policy_refresh(self):
-        self.assertFalse(changes_policy(["main.go", ".github/workflows/ci.yml", "docs/AGENTS.md"]))
+        self.assertFalse(changes_policy(["main.go", "docs/AGENTS.md"]))
         self.assertEqual(self.worker.sync(self.api.pr), "merged")
         self.assertFalse(any(c[0] == "dispatch" for c in self.api.calls))
 
@@ -346,7 +358,7 @@ class AutoMergeTests(unittest.TestCase):
 
     def test_ci_rename_validates_candidate_and_skips_deleted_ci(self):
         self.api.files = [{"filename": ".github/workflows/new.yml", "previous_filename": ".github/workflows/ci.yml"}]
-        self.assertEqual(self.worker.sync(self.api.pr), "merged")
+        self.assertEqual(self.worker.sync(self.api.pr), "merged_policy_refreshed")
         self.assertEqual(self.api.ci_ref, SHA)
 
     def test_gate_edit_validates_candidate_before_merge(self):
@@ -368,7 +380,7 @@ class AutoMergeTests(unittest.TestCase):
                 self.worker.sync(self.api.pr)
         self.assertIn(("dispatch", "POST", {"ref": "main"}), self.api.calls)
         intents = [c[2] for c in self.api.calls if c[0] == "followup"]
-        self.assertEqual(intents, [{"state": "pending", "description": "v1 ci gate"}])
+        self.assertEqual(intents, [{"state": "pending", "description": "v1 ci gate"}, {"state": "pending", "description": "v1 ci"}])
         self.assertTrue(self.worker.policy_merged)
 
     def test_intent_is_persisted_before_irreversible_merge(self):
@@ -411,7 +423,7 @@ class AutoMergeTests(unittest.TestCase):
         page = {"data": {"repository": {"pullRequests": {"nodes": [row], "pageInfo": {"hasNextPage": False}}}}}
         with patch.object(api, "call", return_value=page), patch.object(api, "finish_followup") as finish:
             api.recover_followups("main")
-            finish.assert_called_once_with({"number": 1, "head": {"sha": SHA}}, "main", True, True)
+            finish.assert_called_once_with({"number": 1, "head": {"sha": SHA}}, "main", True, True, recovering=True)
             finish.reset_mock()
             row["mergedBy"] = {"login": "developer", "databaseId": 1}
             api.recover_followups("main")
@@ -427,6 +439,189 @@ class AutoMergeTests(unittest.TestCase):
                 api.verify_gate(SHA)
 
 
+    def test_unknown_merge_response_stops_policy_batch(self):
+        self.api.files = [{"filename": "AGENTS.md"}]
+        original = self.api.call
+        def uncertain(path, method="GET", payload=None):
+            if path.endswith("/merge"):
+                raise TimeoutError("Server result unknown")
+            return original(path, method, payload)
+        with patch.object(self.api, "call", side_effect=uncertain):
+            with self.assertRaises(TimeoutError):
+                self.worker.sync(self.api.pr)
+        self.assertTrue(self.worker.policy_merged)
+
+    def test_policy_needs_candidate_tests_before_merge(self):
+        self.api.files = [{"filename": ".github/scripts/review_gate.py"}]
+        with patch.object(self.api, "candidate_verified", return_value=False):
+            self.assertEqual(self.worker.sync(self.api.pr), "waiting_for_candidate_policy_tests")
+        self.assertEqual(self.mutations(), [])
+
+    def test_incomplete_pr_file_list_refuses_merge(self):
+        self.api.pr["changed_files"] = 3001
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            self.worker.sync(self.api.pr)
+        self.assertEqual(self.mutations(), [])
+
+    def test_auto_request_in_final_snapshot_is_cancelled(self):
+        original = self.api.call
+        def registered(path, method="GET", payload=None):
+            if path.endswith("/pulls/1") and self.api.reads == 3:
+                self.api.pr["auto_merge"] = {"merge_method": "squash"}
+            return original(path, method, payload)
+        with patch.object(self.api, "call", side_effect=registered):
+            self.assertEqual(self.worker.sync(self.api.pr), "changed")
+        self.assertIsNone(self.api.pr["auto_merge"])
+        self.assertFalse(any(c[0].endswith("/merge") for c in self.api.calls))
+
+    def test_recovery_never_dispatches_another_gate(self):
+        self.api.files = [{"filename": "AGENTS.md"}]
+        with patch.object(self.api, "dispatch_ci", side_effect=RuntimeError("CI unavailable")):
+            with self.assertRaises(RuntimeError):
+                self.api.finish_followup(self.api.pr, "main", True, True, recovering=True)
+        self.assertFalse(any(c[0] == "dispatch" for c in self.api.calls))
+        self.assertIn(("refresh", "POST", None), self.api.calls)
+        self.assertEqual(self.api.calls[-1][2], {"state": "pending", "description": "v1 ci"})
+
+    def test_yaml_dispatch_must_be_under_on(self):
+        api = MergeGitHub.__new__(MergeGitHub);api.repo = "owner/repo"
+        import base64
+        for body, allowed in [("name: CI\non: [push, pull_request, workflow_dispatch]", True),
+                              ("name: CI\non:\n  pull_request:\nenv:\n  workflow_dispatch: yes", False),
+                              ('name: CI\n"on":\n    pull_request:\n    workflow_dispatch:', True),
+                              ("name: Other CI\non: [pull_request, workflow_dispatch]", False)]:
+            with patch.object(api, "call", return_value={"content": base64.b64encode(body.encode()).decode()}):
+                if allowed:
+                    self.assertTrue(api.has_ci(SHA))
+                else:
+                    with self.assertRaises(RuntimeError):
+                        api.has_ci(SHA)
+
+    def test_candidate_run_requires_trusted_workflow_identity_and_head(self):
+        api = MergeGitHub.__new__(MergeGitHub);api.repo = "owner/repo"
+        run = {"id": 22, "workflow_id": 7, "event": "pull_request", "path": ".github/workflows/review-policy-tests.yml",
+               "display_title": f"Candidate review policy for PR #1 at {SHA}", "status": "completed", "conclusion": "success"}
+        job = {"name": "candidate", "status": "completed", "conclusion": "success", "steps": [
+            {"name": "Test candidate policy without privileged credentials", "status": "completed", "conclusion": "success"}]}
+        def pages(path, **kwargs):
+            return [job] if path.endswith("/jobs") else [run]
+        def call(path, *args, **kwargs):
+            return {"object": {"sha": "b" * 40}, "status": "ahead", "id": 7, "sha": "same-source"}
+        with patch.object(api, "call", side_effect=call), patch.object(api, "pages", side_effect=pages):
+            self.assertTrue(api.candidate_verified(self.api.pr))
+            for key, bad in [("workflow_id", 9), ("event", "pull_request_target"), ("path", ".github/workflows/untrusted.yml"),
+                             ("display_title", "Candidate review policy for PR #1 at " + "b" * 40), ("conclusion", "failure")]:
+                original = run[key];run[key] = bad
+                self.assertFalse(api.candidate_verified(self.api.pr))
+                run[key] = original
+
+    def test_bridge_edit_requires_candidate_review_events(self):
+        self.api.files = [{"filename": ".github/workflows/review-gate-events.yml"}]
+        with patch.object(self.api, "verify_bridge", side_effect=RuntimeError("bridge event missing")):
+            with self.assertRaises(RuntimeError):
+                self.worker.sync(self.api.pr)
+        self.assertFalse(any(c[0].endswith("/merge") for c in self.api.calls))
+
+
+    def test_recovery_refresh_clears_scope_and_restores_it_on_error(self):
+        api = MergeGitHub.__new__(MergeGitHub)
+        def refresh():
+            self.assertEqual(os.environ["NIMO_GATE_BOOTSTRAP_NUMBERS"], "[]")
+            self.assertEqual(os.environ["NIMO_GATE_BOOTSTRAP_HEADS"], "[]")
+            self.assertTrue(os.environ["NIMO_GATE_BOOTSTRAP_STARTED_AT"])
+            self.assertEqual(os.environ["NIMO_GATE_EPOCH"], "123.1")
+            raise RuntimeError("retry")
+        with patch.dict(os.environ, {"NIMO_GATE_BOOTSTRAP_NUMBERS": "[1]", "NIMO_GATE_EPOCH": "123.1"}), \
+             patch("auto_merge.refresh_review_gate", side_effect=refresh):
+            with self.assertRaises(RuntimeError):
+                api.refresh_gate()
+            self.assertEqual(os.environ["NIMO_GATE_BOOTSTRAP_NUMBERS"], "[1]")
+
+    def test_candidate_workflow_write_permission_is_rejected(self):
+        api = MergeGitHub.__new__(MergeGitHub)
+        config = {"name": "Review Policy Tests", "run-name": 'Candidate review policy for PR #${{ github.event.pull_request.number }} at ${{ github.event.pull_request.head.sha }}',
+                  "on": {"pull_request": {}}, "permissions": {"contents": "write"}, "jobs": {"candidate": {}}}
+        with patch.object(api, "workflow", return_value=config):
+            with self.assertRaises(RuntimeError):
+                api.verify_candidate_workflow(SHA)
+
+
+    def test_deployed_workflows_parse_and_keep_required_contracts(self):
+        from pathlib import Path
+        import base64
+        root = Path(__file__).resolve().parent
+        api = MergeGitHub.__new__(MergeGitHub);api.repo = "owner/repo"
+        methods = {"review-gate.yml": api.verify_gate, "review-gate-events.yml": api.verify_bridge,
+                   "review-policy-tests.yml": api.verify_candidate_workflow}
+        for name, validate in methods.items():
+            path = root / name
+            if not path.exists():
+                path = root.parent / "workflows" / name
+            with patch.object(api, "call", return_value={"content": base64.b64encode(path.read_bytes()).decode()}):
+                validate(SHA)
+
+
+    def test_modified_candidate_runner_cannot_attest_itself(self):
+        api = MergeGitHub.__new__(MergeGitHub);api.repo = "owner/repo"
+        with patch.object(api, "call", side_effect=[{"object": {"sha": "b" * 40}}, {"status": "ahead"}, {"sha": "trusted"}, {"sha": "modified"}]):
+            self.assertFalse(api.candidate_verified(self.api.pr))
+
+
+    def test_global_recovery_initializes_both_previously_owned_heads(self):
+        from review_gate import GitHub
+        api = MergeGitHub.__new__(MergeGitHub)
+        gate = GitHub.__new__(GitHub);gate.repo = "owner/repo"
+        owners = {SHA: "old.1", "b" * 40: "old.2"}
+        def initialize(sha, state, initialize=False):
+            self.assertTrue(initialize)
+            self.assertEqual(state, "pending")
+            owners[sha] = os.environ["NIMO_GATE_EPOCH"]
+        def assert_owner(sha):
+            self.assertEqual(owners[sha], os.environ["NIMO_GATE_EPOCH"])
+        def refresh():
+            for sha in owners:
+                gate.check(sha)
+        with patch.dict(os.environ, {"NIMO_GATE_EPOCH": "123.1", "NIMO_GATE_BOOTSTRAP_HEADS": json.dumps([SHA]),
+                                     "NIMO_GATE_BOOTSTRAP_NUMBERS": "[1]", "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "123"}), \
+             patch.object(gate, "status", side_effect=initialize), patch.object(gate, "assert_current_epoch", side_effect=assert_owner), \
+             patch.object(gate, "pages", return_value=[]), patch.object(gate, "call", return_value={"id": 1, "app": {"id": 15368}}), \
+             patch("auto_merge.refresh_review_gate", side_effect=refresh):
+            api.refresh_gate()
+        self.assertEqual(set(owners.values()), {"123.1"})
+
+
+
+
+    def test_skipped_candidate_job_or_test_step_cannot_attest_policy(self):
+        api = MergeGitHub.__new__(MergeGitHub);api.repo = "owner/repo"
+        run = {"id": 22, "workflow_id": 7, "event": "pull_request", "path": ".github/workflows/review-policy-tests.yml",
+               "display_title": f"Candidate review policy for PR #1 at {SHA}", "status": "completed", "conclusion": "success"}
+        job = {"name": "candidate", "status": "completed", "conclusion": "success", "steps": [
+            {"name": "Test candidate policy without privileged credentials", "status": "completed", "conclusion": "success"}]}
+        def pages(path, **kwargs):
+            return [job] if path.endswith("/jobs") else [run]
+        with patch.object(api, "call", return_value={"object": {"sha": "b" * 40}, "status": "ahead", "id": 7, "sha": "same"}), \
+             patch.object(api, "pages", side_effect=pages):
+            self.assertTrue(api.candidate_verified(self.api.pr))
+            job["conclusion"] = "skipped"
+            self.assertFalse(api.candidate_verified(self.api.pr))
+            job["conclusion"] = "success"
+            job["steps"][0]["conclusion"] = "skipped"
+            self.assertFalse(api.candidate_verified(self.api.pr))
+
+    def test_policy_head_must_include_current_default_branch(self):
+        api = MergeGitHub.__new__(MergeGitHub);api.repo = "owner/repo"
+        for status in ["behind", "diverged"]:
+            with patch.object(api, "call", side_effect=[{"object": {"sha": "b" * 40}}, {"status": status}]), \
+                 patch.object(api, "pages") as pages:
+                self.assertFalse(api.candidate_verified(self.api.pr))
+                pages.assert_not_called()
+
+    def test_policy_base_advance_during_verification_prevents_merge(self):
+        self.api.files = [{"filename": ".github/scripts/review_gate.py"}]
+        with patch.object(self.api, "candidate_verified", side_effect=[True, False]):
+            self.assertEqual(self.worker.sync(self.api.pr), "waiting_for_candidate_policy_tests")
+        self.assertFalse(any(c[0].endswith("/merge") for c in self.api.calls))
 
 if __name__ == "__main__":
     unittest.main()
