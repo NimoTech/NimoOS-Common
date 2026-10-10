@@ -3,6 +3,7 @@ name: CI
 # Build, vet and test on every pull request, and on main so a bad merge shows up
 # immediately rather than surprising the next person to open a PR.
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]

@@ -5,7 +5,7 @@ on:
   pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened, converted_to_draft, labeled, unlabeled, edited, closed]
   workflow_run:
-    workflows: [Review Gate Events]
+    workflows: [Review Gate Events, CI, PR Check YAML, validate docker compose file]
     types: [completed]
   issue_comment:
     types: [created, edited, deleted]
@@ -13,6 +13,11 @@ on:
     branches: [main]
     paths: ['.github/scripts/**', '.github/workflows/review-gate*.yml', 'AGENTS.md']
   workflow_dispatch:
+    inputs:
+      auto_merge_retry:
+        description: Internal bounded mergeability retry counter
+        required: false
+        default: '0'
 permissions:
   contents: read
   pull-requests: write
@@ -24,7 +29,11 @@ env:
 jobs:
   invalidate:
     if: >-
-      github.event_name != 'issue_comment' ||
+      (github.event_name != 'workflow_run' ||
+       github.event.workflow_run.name == 'Review Gate Events' ||
+       github.event.workflow_run.event == 'pull_request' ||
+       github.event.workflow_run.event == 'pull_request_target') &&
+      (github.event_name != 'issue_comment' ||
       (github.event.issue.pull_request &&
        (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' ||
         github.event.comment.user.login == 'claude[bot]' ||
@@ -34,7 +43,7 @@ jobs:
          (contains(github.event.comment.body, '@codex') ||
           contains(github.event.comment.body, '@claude') ||
           contains(github.event.changes.body.from, '@codex') ||
-          contains(github.event.changes.body.from, '@claude')))))
+          contains(github.event.changes.body.from, '@claude'))))))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -208,6 +217,14 @@ jobs:
               print("::warning::Blocked " + str(len(errors)) + " failed commit groups; continuing healthy groups")
           PYTHON
   gate:
+    # Only this trusted metadata publisher may request protected squash merges.
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+      issues: read
+      checks: write
+      statuses: write
     needs: invalidate
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -233,13 +250,19 @@ jobs:
             .github/workflows/review-gate.yml
           sparse-checkout-cone-mode: false
       - name: Verify gate policy
+        id: verify
         run: >-
           env -u NIMO_GATE_EPOCH -u NIMO_GATE_BOOTSTRAP_STARTED_AT -u NIMO_GATE_BOOTSTRAP_HEADS
           -u NIMO_GATE_BOOTSTRAP_FAILURES -u NIMO_GATE_BOOTSTRAP_NUMBERS
           -u NIMO_GATE_BOOTSTRAP_AFFECTED_HEADS -u GITHUB_OUTPUT
-          python3 -m unittest discover -s .github/scripts -p test_review_gate.py -q
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py' -q
       - name: Publish current-commit review gate
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/review_gate.py
 
+      - name: Squash PRs after verified review and GitHub requirements
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/auto_merge.py
