@@ -617,6 +617,31 @@ class AutoMergeTests(unittest.TestCase):
                 self.assertFalse(api.candidate_verified(self.api.pr))
                 pages.assert_not_called()
 
+    def test_hold_during_candidate_verification_prevents_merge(self):
+        self.api.files = [{"filename": ".github/scripts/review_gate.py"}]
+        calls = []
+        def verify(pr):
+            calls.append(pr)
+            if len(calls) == 2:
+                self.api.pr["labels"] = [{"name": "hold"}]
+            return True
+        with patch.object(self.api, "candidate_verified", side_effect=verify):
+            self.assertEqual(self.worker.sync(self.api.pr), "changed")
+        self.assertFalse(any(c[0].endswith("/merge") for c in self.api.calls))
+
+    def test_new_epoch_during_candidate_verification_prevents_merge(self):
+        self.api.files = [{"filename": ".github/scripts/review_gate.py"}]
+        calls = []
+        def verify(pr):
+            calls.append(pr)
+            if len(calls) == 2:
+                self.api.superseded = True
+            return True
+        with patch.object(self.api, "candidate_verified", side_effect=verify):
+            with self.assertRaises(SupersededEvaluation):
+                self.worker.sync(self.api.pr)
+        self.assertFalse(any(c[0].endswith("/merge") for c in self.api.calls))
+
     def test_policy_base_advance_during_verification_prevents_merge(self):
         self.api.files = [{"filename": ".github/scripts/review_gate.py"}]
         with patch.object(self.api, "candidate_verified", side_effect=[True, False]):

@@ -365,14 +365,15 @@ class AutoMerge:
             state, _ = checked_decision(self.api, current)
             if state != "success":
                 return "waiting_for_valid_review"
+            if policy_changed and not self.api.candidate_verified(current):
+                return "waiting_for_candidate_policy_tests"
+            self.api.assert_current_epoch(sha)
             final = self.api.call(f"repos/{self.api.repo}/pulls/{n}")
             if final.get("auto_merge"):
                 self.disable(final)
                 return "changed"
             if not unchanged(current, final) or not eligible(final, self.default):
                 return "changed"
-            if policy_changed and not self.api.candidate_verified(final):
-                return "waiting_for_candidate_policy_tests"
             # The GitHub API binds this PUT to the head SHA and native branch
             # rules. Labels/custom evidence have no atomic compare-and-merge
             # API: this is the final observed snapshot, not a transactional lock
