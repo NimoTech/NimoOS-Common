@@ -1,4 +1,5 @@
 import copy
+import http.client
 import unittest
 import json
 import tempfile
@@ -53,8 +54,11 @@ class FakeGitHub:
     def recover_followups(self, default):
         pass
 
-    def dispatch_retry(self, default, attempt, numbers):
-        self.calls.append(("retry", "POST", {"attempt": attempt, "numbers": sorted(numbers)}))
+    def dispatch_retry(self, default, attempt, numbers, recovery_attempt=0):
+        payload = {"attempt": attempt, "numbers": sorted(numbers)}
+        if recovery_attempt:
+            payload["recovery_attempt"] = recovery_attempt
+        self.calls.append(("retry", "POST", payload))
 
     def dispatch_workflow(self, workflow, default):
         (self.dispatch_gate if workflow == "review-gate.yml" else self.dispatch_ci)(default)
@@ -736,7 +740,7 @@ class AutoMergeTests(unittest.TestCase):
                         raise TimeoutError("Server result unavailable")
                     return original(path, method, payload)
                 with tempfile.NamedTemporaryFile(mode="w+") as f:
-                    json.dump({"repository": {"default_branch": "main"}, "inputs": {"auto_merge_retry": str(attempt)}}, f);f.flush()
+                    json.dump({"repository": {"default_branch": "main"}, "inputs": {"auto_merge_recovery_retry": str(attempt)}}, f);f.flush()
                     with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name, "NIMO_GATE_BOOTSTRAP_NUMBERS": "[1]"}), \
                          patch("auto_merge.MergeGitHub", return_value=api), patch.object(api, "call", side_effect=uncertain), \
                          patch("auto_merge.time.sleep"):
@@ -745,7 +749,7 @@ class AutoMergeTests(unittest.TestCase):
                 retries = [c for c in api.calls if c[0] == "retry"]
                 self.assertEqual(len(retries), int(attempt == 0))
                 if retries:
-                    self.assertEqual(retries[0][2], {"attempt": 1, "numbers": [1]})
+                    self.assertEqual(retries[0][2], {"attempt": 0, "numbers": [1], "recovery_attempt": 1})
 
     def test_definitive_merge_rejection_does_not_schedule_ambiguous_recovery(self):
         import urllib.error
@@ -821,6 +825,209 @@ class AutoMergeTests(unittest.TestCase):
                 run()
         merged = [c[0] for c in api.calls if c[0].endswith("/merge")]
         self.assertEqual(merged, ["repos/owner/repo/pulls/1/merge", "repos/owner/repo/pulls/2/merge"])
+
+
+    @staticmethod
+    def incomplete_http_response(path, method="GET", payload=None):
+        from review_gate import GitHub
+        api = GitHub.__new__(GitHub)
+        api.api, api.token = "https://api.github.com", "test-token"
+        # Exercise the real urllib response -> json.load path, rather than a
+        # synthetic transport exception raised directly by the fake client.
+        with patch("review_gate.urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.side_effect = \
+                http.client.IncompleteRead(b'{"merged": true', 8)
+            return GitHub.call(api, path, method, payload)
+
+    def test_incomplete_merge_response_immediately_runs_confirmed_followups(self):
+        self.api.files = [{"filename": "AGENTS.md"}]
+        self.api.ci = True
+        original = self.api.call
+        def incomplete(path, method="GET", payload=None):
+            if path.endswith("/merge"):
+                self.api.pr.update(merged=True, state="closed")
+                return self.incomplete_http_response(path, method, payload)
+            return original(path, method, payload)
+        with patch.object(self.api, "call", side_effect=incomplete):
+            self.assertEqual(self.worker.sync(self.api.pr), "merged_policy_refreshed")
+        self.assertTrue(self.worker.policy_merged)
+        self.assertEqual(self.worker.recovery_needed, set())
+        self.assertIn(("dispatch_ci", "POST", {"ref": "main"}), self.api.calls)
+        self.assertIn(("dispatch", "POST", {"ref": "main"}), self.api.calls)
+
+    def test_incomplete_confirmation_schedules_bounded_durable_recovery(self):
+        for attempt in [0, 3]:
+            with self.subTest(attempt=attempt):
+                api = FakeGitHub();api.files = [{"filename": "AGENTS.md"}]
+                original = api.call
+                merged = False
+                def incomplete(path, method="GET", payload=None):
+                    nonlocal merged
+                    if path.endswith("/merge"):
+                        merged = True
+                        api.pr.update(merged=True, state="closed")
+                        return self.incomplete_http_response(path, method, payload)
+                    if merged and path == "repos/owner/repo/pulls/1":
+                        return self.incomplete_http_response(path, method, payload)
+                    return original(path, method, payload)
+                with tempfile.NamedTemporaryFile(mode="w+") as f:
+                    json.dump({"repository": {"default_branch": "main"},
+                               "inputs": {"auto_merge_recovery_retry": str(attempt)}}, f);f.flush()
+                    with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name,
+                                                 "NIMO_GATE_BOOTSTRAP_NUMBERS": "[1]"}), \
+                         patch("auto_merge.MergeGitHub", return_value=api), \
+                         patch.object(api, "call", side_effect=incomplete), patch("auto_merge.time.sleep"):
+                        with self.assertRaises(RuntimeError):
+                            run()
+                retries = [c for c in api.calls if c[0] == "retry"]
+                self.assertEqual(len(retries), int(attempt == 0))
+                if retries:
+                    self.assertEqual(retries[0][2], {"attempt": 0, "numbers": [1], "recovery_attempt": 1})
+                self.assertFalse(any(c[0] in {"dispatch", "dispatch_ci"} for c in api.calls))
+
+    def test_mixed_mergeability_and_recovery_keep_every_permitted_retry(self):
+        for policy_changed in [False, True]:
+            with self.subTest(policy_changed=policy_changed):
+                api = FakeGitHub();api.ci = True
+                original_call, original_pages = api.call, api.pages
+                merged = False
+                def mixed(path, method="GET", payload=None):
+                    nonlocal merged
+                    if path == "graphql" and method == "POST" and payload["query"].startswith("query"):
+                        info = copy.deepcopy(api.info)
+                        if payload["variables"]["number"] == 1:
+                            info["mergeStateStatus"] = "UNKNOWN"
+                        return {"data": {"repository": {"pullRequest": info}}}
+                    if path.endswith("/pulls/2/merge"):
+                        merged = True
+                        return self.incomplete_http_response(path, method, payload)
+                    if path == "repos/owner/repo/pulls/2":
+                        if merged:
+                            return self.incomplete_http_response(path, method, payload)
+                        return {**copy.deepcopy(api.pr), "number": 2}
+                    return original_call(path, method, payload)
+                def files(path, **kwargs):
+                    if path.endswith("/pulls/2/files"):
+                        return [{"filename": "AGENTS.md" if policy_changed else "README.md"}]
+                    return original_pages(path, **kwargs)
+                with tempfile.NamedTemporaryFile(mode="w+") as f:
+                    json.dump({"repository": {"default_branch": "main"}}, f);f.flush()
+                    with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name,
+                                                 "NIMO_GATE_BOOTSTRAP_NUMBERS": "[]"}), \
+                         patch("auto_merge.MergeGitHub", return_value=api), \
+                         patch.object(api, "call", side_effect=mixed), \
+                         patch.object(api, "pages", side_effect=files), patch("auto_merge.time.sleep"):
+                        with self.assertRaises(RuntimeError):
+                            run()
+                retries = [c for c in api.calls if c[0] == "retry"]
+                self.assertEqual(len(retries), 1)
+                self.assertEqual(retries[0][2], {"attempt": int(not policy_changed), "recovery_attempt": 1,
+                    "numbers": [2] if policy_changed else [1, 2]})
+
+
+    def test_first_unknown_merge_response_has_budget_after_final_mergeability_poll(self):
+        api = FakeGitHub();api.files = [{"filename": "AGENTS.md"}]
+        original = api.call
+        def uncertain(path, method="GET", payload=None):
+            if path.endswith("/merge"):
+                return self.incomplete_http_response(path, method, payload)
+            return original(path, method, payload)
+        with tempfile.NamedTemporaryFile(mode="w+") as f:
+            json.dump({"repository": {"default_branch": "main"},
+                       "inputs": {"auto_merge_retry": "3"}}, f);f.flush()
+            with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name,
+                                         "NIMO_GATE_BOOTSTRAP_NUMBERS": "[1]"}), \
+                 patch("auto_merge.MergeGitHub", return_value=api), \
+                 patch.object(api, "call", side_effect=uncertain), patch("auto_merge.time.sleep"):
+                with self.assertRaises(RuntimeError):
+                    run()
+        retries = [c for c in api.calls if c[0] == "retry"]
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(retries[0][2], {"attempt": 3, "recovery_attempt": 1, "numbers": [1]})
+
+    def test_merge_response_recovery_budget_is_carried_and_stops_after_three_dispatches(self):
+        api = FakeGitHub();api.files = [{"filename": "AGENTS.md"}]
+        original = api.call
+        def uncertain(path, method="GET", payload=None):
+            if path.endswith("/merge"):
+                return self.incomplete_http_response(path, method, payload)
+            return original(path, method, payload)
+        recovery = 0
+        for _ in range(4):
+            api.calls.clear()
+            with tempfile.NamedTemporaryFile(mode="w+") as f:
+                json.dump({"repository": {"default_branch": "main"}, "inputs": {
+                    "auto_merge_retry": "3", "auto_merge_recovery_retry": str(recovery)}}, f);f.flush()
+                with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name,
+                                             "NIMO_GATE_BOOTSTRAP_NUMBERS": "[1]"}), \
+                     patch("auto_merge.MergeGitHub", return_value=api), \
+                     patch.object(api, "call", side_effect=uncertain), patch("auto_merge.time.sleep"):
+                    with self.assertRaises(RuntimeError):
+                        run()
+            retries = [c for c in api.calls if c[0] == "retry"]
+            if recovery == 3:
+                self.assertEqual(retries, [])
+            else:
+                self.assertEqual(len(retries), 1)
+                self.assertEqual(retries[0][2], {"attempt": 3, "recovery_attempt": recovery + 1, "numbers": [1]})
+                recovery = retries[0][2]["recovery_attempt"]
+
+    def test_mixed_retry_budgets_dispatch_only_categories_with_remaining_attempts(self):
+        for retry, recovery in [(0, 0), (3, 0), (0, 3), (3, 3)]:
+            with self.subTest(retry=retry, recovery=recovery):
+                api = FakeGitHub();api.ci = True
+                original_call, original_pages = api.call, api.pages
+                def mixed(path, method="GET", payload=None):
+                    if path == "graphql" and method == "POST" and payload["query"].startswith("query"):
+                        info = copy.deepcopy(api.info)
+                        if payload["variables"]["number"] == 1:
+                            info["mergeStateStatus"] = "UNKNOWN"
+                        return {"data": {"repository": {"pullRequest": info}}}
+                    if path.endswith("/pulls/2/merge"):
+                        return self.incomplete_http_response(path, method, payload)
+                    if path == "repos/owner/repo/pulls/2":
+                        return {**copy.deepcopy(api.pr), "number": 2}
+                    return original_call(path, method, payload)
+                def files(path, **kwargs):
+                    if path.endswith("/pulls/2/files"):
+                        return [{"filename": "README.md"}]
+                    return original_pages(path, **kwargs)
+                with tempfile.NamedTemporaryFile(mode="w+") as f:
+                    json.dump({"repository": {"default_branch": "main"}, "inputs": {
+                        "auto_merge_retry": str(retry), "auto_merge_recovery_retry": str(recovery)}}, f);f.flush()
+                    with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name,
+                                                 "NIMO_GATE_BOOTSTRAP_NUMBERS": "[]"}), \
+                         patch("auto_merge.MergeGitHub", return_value=api), \
+                         patch.object(api, "call", side_effect=mixed), \
+                         patch.object(api, "pages", side_effect=files), patch("auto_merge.time.sleep"):
+                        with self.assertRaises(RuntimeError):
+                            run()
+                retries = [c for c in api.calls if c[0] == "retry"]
+                numbers = ([1] if retry < 3 else []) + ([2] if recovery < 3 else [])
+                if not numbers:
+                    self.assertEqual(retries, [])
+                else:
+                    self.assertEqual(len(retries), 1)
+                    expected = {"attempt": retry + int(retry < 3), "numbers": numbers,
+                                "recovery_attempt": recovery + int(recovery < 3)}
+                    self.assertEqual(retries[0][2], expected)
+
+    def test_retry_dispatch_contract_carries_two_independent_counters(self):
+        api = MergeGitHub.__new__(MergeGitHub)
+        with patch.object(api, "dispatch_workflow") as dispatch:
+            api.dispatch_retry("main", 3, {2, 1}, recovery_attempt=1)
+            dispatch.assert_called_once_with("review-gate.yml", "main", {
+                "auto_merge_retry": "3", "auto_merge_recovery_retry": "1", "auto_merge_numbers": "[1, 2]"})
+        import base64
+        from pathlib import Path
+        config = MergeGitHub.__new__(MergeGitHub);config.repo = "owner/repo"
+        path = Path(__file__).resolve().with_name("review-gate.yml")
+        if not path.exists():
+            path = path.parent.parent / "workflows" / path.name
+        with patch.object(config, "call", return_value={"content": base64.b64encode(path.read_bytes()).decode()}):
+            inputs = config.workflow("review-gate.yml", "main")["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(inputs["auto_merge_recovery_retry"]["default"], "0")
+        self.assertEqual(inputs["auto_merge_recovery_retry"]["required"], "false")
 
 if __name__ == "__main__":
     unittest.main()

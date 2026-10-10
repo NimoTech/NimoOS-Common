@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Squash reviewed PRs using the Actions token and the existing branch rules."""
 import json
+import http.client
 import datetime
 import os
 import time
@@ -270,8 +271,11 @@ class MergeGitHub(GitHub):
         if errors:
             raise RuntimeError("Merge completed; durable followup awaits retry: " + "; ".join(errors))
 
-    def dispatch_retry(self, default, attempt, numbers):
-        self.dispatch_workflow("review-gate.yml", default, {"auto_merge_retry": str(attempt), "auto_merge_numbers": json.dumps(sorted(numbers))})
+    def dispatch_retry(self, default, attempt, numbers, recovery_attempt=0):
+        self.dispatch_workflow("review-gate.yml", default, {
+            "auto_merge_retry": str(attempt),
+            "auto_merge_recovery_retry": str(recovery_attempt),
+            "auto_merge_numbers": json.dumps(sorted(numbers))})
 
     def dispatch_workflow(self, workflow, default, inputs=None):
         # Dispatch is one of the events GitHub permits GITHUB_TOKEN to trigger.
@@ -450,13 +454,13 @@ class AutoMerge:
             try:
                 result = self.api.call(f"repos/{self.api.repo}/pulls/{n}/merge", "PUT", {
                     "sha": sha, "merge_method": "squash"})
-            except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as error:
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, json.JSONDecodeError) as error:
                 # A definitive rejection is not an ambiguous successful merge.
                 if isinstance(error, urllib.error.HTTPError) and error.code < 500:
                     raise
                 try:
                     observed = self.api.call(f"repos/{self.api.repo}/pulls/{n}")
-                except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError):
+                except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, json.JSONDecodeError):
                     observed = None
                 if (observed and observed.get("merged")
                         and observed.get("head", {}).get("sha") == sha):
@@ -511,16 +515,24 @@ def run():
         if worker.policy_merged:
             print("Review policy changed; remaining PRs await a new default-branch evaluation.")
             break
-    retry_numbers = worker.recovery_needed or (worker.retry_needed if not worker.policy_merged else set())
-    if retry_numbers:
+    # Mergeability polling and uncertain successful merge responses have
+    # independent bounded budgets. A first lost PUT response on the final
+    # mergeability poll must still get its own durable recovery attempt.
+    retries = worker.retry_needed if not worker.policy_merged else set()
+    if retries or worker.recovery_needed:
         retry = int(event.get("inputs", {}).get("auto_merge_retry", "0"))
-        if retry not in range(4):
-            raise RuntimeError("Invalid mergeability retry count")
-        if retry < 3:
+        recovery = int(event.get("inputs", {}).get("auto_merge_recovery_retry", "0"))
+        if retry not in range(4) or recovery not in range(4):
+            raise RuntimeError("Invalid automatic merge retry count")
+        pending_retries = retries if retry < 3 else set()
+        pending_recovery = worker.recovery_needed if recovery < 3 else set()
+        retry_numbers = pending_retries | pending_recovery
+        if retry_numbers:
             time.sleep(10)
-            api.dispatch_retry(default, retry + 1, retry_numbers)
-        else:
-            raise RuntimeError("GitHub mergeability remains unknown after bounded retries; rerun this workflow.")
+            api.dispatch_retry(default, retry + bool(pending_retries), retry_numbers,
+                               recovery + bool(pending_recovery))
+        if (retries and retry == 3) or (worker.recovery_needed and recovery == 3):
+            raise RuntimeError("Automatic merge remains uncertain after bounded retries; rerun this workflow.")
     if failures:
         raise RuntimeError("Auto-merge needs retry for PRs: " + ", ".join(map(str, failures)))
 
