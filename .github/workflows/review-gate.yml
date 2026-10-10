@@ -22,6 +22,10 @@ on:
         description: Internal bounded uncertain merge-response recovery counter
         required: false
         default: '0'
+      auto_merge_retry_state:
+        description: Internal per-PR bounded mergeability and recovery state
+        required: false
+        default: '{}'
       auto_merge_numbers:
         description: Internal PR scope for bounded retries
         required: false

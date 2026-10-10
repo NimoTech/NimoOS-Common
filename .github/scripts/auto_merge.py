@@ -271,11 +271,13 @@ class MergeGitHub(GitHub):
         if errors:
             raise RuntimeError("Merge completed; durable followup awaits retry: " + "; ".join(errors))
 
-    def dispatch_retry(self, default, attempt, numbers, recovery_attempt=0):
-        self.dispatch_workflow("review-gate.yml", default, {
-            "auto_merge_retry": str(attempt),
-            "auto_merge_recovery_retry": str(recovery_attempt),
-            "auto_merge_numbers": json.dumps(sorted(numbers))})
+    def dispatch_retry(self, default, attempt, numbers, recovery_attempt=0, retry_state=None):
+        inputs = {"auto_merge_retry": str(attempt),
+                  "auto_merge_recovery_retry": str(recovery_attempt),
+                  "auto_merge_numbers": json.dumps(sorted(numbers))}
+        if retry_state is not None:
+            inputs["auto_merge_retry_state"] = json.dumps(retry_state, sort_keys=True, separators=(",", ":"))
+        self.dispatch_workflow("review-gate.yml", default, inputs)
 
     def dispatch_workflow(self, workflow, default, inputs=None):
         # Dispatch is one of the events GitHub permits GITHUB_TOKEN to trigger.
@@ -485,9 +487,47 @@ class AutoMerge:
         return "waiting_for_github_requirements"
 
 
+def retry_budgets(event):
+    """Validate bounded dispatch state before any API writes."""
+    inputs = event.get("inputs", {})
+    legacy = {}
+    for name, key in [("auto_merge_retry", "mergeability"),
+                      ("auto_merge_recovery_retry", "recovery")]:
+        value = inputs.get(name, "0")
+        if not isinstance(value, str) or value not in {"0", "1", "2", "3"}:
+            raise RuntimeError("Invalid automatic merge retry count")
+        legacy[key] = int(value)
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise RuntimeError("Duplicate automatic merge retry state key")
+            result[key] = value
+        return result
+    raw = inputs.get("auto_merge_retry_state", "{}")
+    if not isinstance(raw, str):
+        raise RuntimeError("Invalid automatic merge retry state")
+    try:
+        state = json.loads(raw, object_pairs_hook=unique_object)
+    except (ValueError, TypeError) as error:
+        raise RuntimeError("Invalid automatic merge retry state") from error
+    if not isinstance(state, dict) or len(state) > 10000:
+        raise RuntimeError("Invalid automatic merge retry state")
+    for number, counts in state.items():
+        if (not re.fullmatch(r"[1-9][0-9]*", number)
+                or not isinstance(counts, dict)
+                or set(counts) != {"mergeability", "recovery"}
+                or any(type(value) is not int or value not in range(4) for value in counts.values())):
+            raise RuntimeError("Invalid automatic merge retry state")
+    # Legacy shared counters only seed old callers that have no per-PR state.
+    # Once this chain has a map, a newly encountered PR starts its own budget.
+    return state, legacy if not state else {"mergeability": 0, "recovery": 0}
+
+
 def run():
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
         event = json.load(f)
+    budgets, initial_budget = retry_budgets(event)
     api = MergeGitHub()
     default = event["repository"]["default_branch"]
     meta = api.call(f"repos/{api.repo}")
@@ -515,24 +555,32 @@ def run():
         if worker.policy_merged:
             print("Review policy changed; remaining PRs await a new default-branch evaluation.")
             break
-    # Mergeability polling and uncertain successful merge responses have
-    # independent bounded budgets. A first lost PUT response on the final
-    # mergeability poll must still get its own durable recovery attempt.
+    # Keep independent budgets for every PR and for each failure category.
+    # One PR exhausting recovery cannot consume another PR's first lost PUT.
     retries = worker.retry_needed if not worker.policy_merged else set()
-    if retries or worker.recovery_needed:
-        retry = int(event.get("inputs", {}).get("auto_merge_retry", "0"))
-        recovery = int(event.get("inputs", {}).get("auto_merge_recovery_retry", "0"))
-        if retry not in range(4) or recovery not in range(4):
-            raise RuntimeError("Invalid automatic merge retry count")
-        pending_retries = retries if retry < 3 else set()
-        pending_recovery = worker.recovery_needed if recovery < 3 else set()
-        retry_numbers = pending_retries | pending_recovery
+    wanted = retries | worker.recovery_needed
+    if wanted:
+        retry_numbers, exhausted = set(), set()
+        for number in wanted:
+            counts = budgets.setdefault(str(number), dict(initial_budget))
+            for category, needed in [("mergeability", number in retries),
+                                     ("recovery", number in worker.recovery_needed)]:
+                if not needed:
+                    continue
+                if counts[category] < 3:
+                    counts[category] += 1
+                    retry_numbers.add(number)
+                else:
+                    exhausted.add(number)
         if retry_numbers:
             time.sleep(10)
-            api.dispatch_retry(default, retry + bool(pending_retries), retry_numbers,
-                               recovery + bool(pending_recovery))
-        if (retries and retry == 3) or (worker.recovery_needed and recovery == 3):
-            raise RuntimeError("Automatic merge remains uncertain after bounded retries; rerun this workflow.")
+            # Retain exhausted entries outside this scope: a recovered global
+            # policy evaluation must not reset those PRs within the same chain.
+            api.dispatch_retry(default, max(x["mergeability"] for x in budgets.values()),
+                retry_numbers, max(x["recovery"] for x in budgets.values()), retry_state=budgets)
+        if exhausted:
+            raise RuntimeError("Automatic merge remains uncertain after bounded retries for PRs: "
+                               + ", ".join(map(str, sorted(exhausted))))
     if failures:
         raise RuntimeError("Auto-merge needs retry for PRs: " + ", ".join(map(str, failures)))
 

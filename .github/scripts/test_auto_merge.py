@@ -25,6 +25,7 @@ class FakeGitHub:
         self.files = [{"filename": "README.md"}]
         self.ci = False
         self.base_tip = "b" * 40
+        self.retry_states = []
 
     finish_followup = MergeGitHub.finish_followup
 
@@ -54,7 +55,9 @@ class FakeGitHub:
     def recover_followups(self, default):
         pass
 
-    def dispatch_retry(self, default, attempt, numbers, recovery_attempt=0):
+    def dispatch_retry(self, default, attempt, numbers, recovery_attempt=0, retry_state=None):
+        if retry_state is not None:
+            self.retry_states.append(copy.deepcopy(retry_state))
         payload = {"attempt": attempt, "numbers": sorted(numbers)}
         if recovery_attempt:
             payload["recovery_attempt"] = recovery_attempt
@@ -923,6 +926,10 @@ class AutoMergeTests(unittest.TestCase):
                 self.assertEqual(len(retries), 1)
                 self.assertEqual(retries[0][2], {"attempt": int(not policy_changed), "recovery_attempt": 1,
                     "numbers": [2] if policy_changed else [1, 2]})
+                expected_state = {"2": {"mergeability": 0, "recovery": 1}}
+                if not policy_changed:
+                    expected_state["1"] = {"mergeability": 1, "recovery": 0}
+                self.assertEqual(api.retry_states[-1], expected_state)
 
 
     def test_first_unknown_merge_response_has_budget_after_final_mergeability_poll(self):
@@ -1018,6 +1025,12 @@ class AutoMergeTests(unittest.TestCase):
             api.dispatch_retry("main", 3, {2, 1}, recovery_attempt=1)
             dispatch.assert_called_once_with("review-gate.yml", "main", {
                 "auto_merge_retry": "3", "auto_merge_recovery_retry": "1", "auto_merge_numbers": "[1, 2]"})
+        with patch.object(api, "dispatch_workflow") as dispatch:
+            state = {"1": {"mergeability": 3, "recovery": 0},
+                     "2": {"mergeability": 0, "recovery": 1}}
+            api.dispatch_retry("main", 3, {2, 1}, recovery_attempt=1, retry_state=state)
+            sent = dispatch.call_args.args[2]
+            self.assertEqual(json.loads(sent["auto_merge_retry_state"]), state)
         import base64
         from pathlib import Path
         config = MergeGitHub.__new__(MergeGitHub);config.repo = "owner/repo"
@@ -1028,6 +1041,120 @@ class AutoMergeTests(unittest.TestCase):
             inputs = config.workflow("review-gate.yml", "main")["on"]["workflow_dispatch"]["inputs"]
         self.assertEqual(inputs["auto_merge_recovery_retry"]["default"], "0")
         self.assertEqual(inputs["auto_merge_recovery_retry"]["required"], "false")
+        self.assertEqual(inputs["auto_merge_retry_state"]["default"], "{}")
+        self.assertEqual(inputs["auto_merge_retry_state"]["required"], "false")
+
+
+    def test_another_pr_exhausting_recovery_does_not_consume_first_lost_put_budget(self):
+        api = FakeGitHub();api.ci = True
+        original_call, original_pages = api.call, api.pages
+        turn = 0
+        def mixed(path, method="GET", payload=None):
+            if path == "graphql" and method == "POST" and payload["query"].startswith("query"):
+                info = copy.deepcopy(api.info)
+                if payload["variables"]["number"] == 2 and turn < 3:
+                    info["mergeStateStatus"] = "UNKNOWN"
+                return {"data": {"repository": {"pullRequest": info}}}
+            if path.endswith("/merge"):
+                return self.incomplete_http_response(path, method, payload)
+            if path == "repos/owner/repo/pulls/2":
+                return {**copy.deepcopy(api.pr), "number": 2}
+            return original_call(path, method, payload)
+        def files(path, **kwargs):
+            if path.endswith("/pulls/2/files"):
+                return [{"filename": "README.md"}]
+            return original_pages(path, **kwargs)
+        state, scope, legacy_retry, legacy_recovery = {}, [], "0", "0"
+        observed = []
+        for turn in range(7):
+            api.calls.clear();api.retry_states.clear()
+            with tempfile.NamedTemporaryFile(mode="w+") as f:
+                json.dump({"repository": {"default_branch": "main"}, "inputs": {
+                    "auto_merge_retry_state": json.dumps(state), "auto_merge_retry": legacy_retry,
+                    "auto_merge_recovery_retry": legacy_recovery}}, f);f.flush()
+                with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name,
+                    "NIMO_GATE_BOOTSTRAP_NUMBERS": json.dumps(scope), "NIMO_GATE_BOOTSTRAP_AFFECTED_HEADS": "[]"}), \
+                     patch("auto_merge.MergeGitHub", return_value=api), \
+                     patch.object(api, "call", side_effect=mixed), \
+                     patch.object(api, "pages", side_effect=files), patch("auto_merge.time.sleep"):
+                    with self.assertRaises(RuntimeError):
+                        run()
+            dispatches = [c for c in api.calls if c[0] == "retry"]
+            if turn == 6:
+                self.assertEqual(dispatches, [])
+                continue
+            self.assertEqual(len(dispatches), 1)
+            state = api.retry_states[-1]
+            payload = dispatches[0][2]
+            scope = payload["numbers"]
+            legacy_retry, legacy_recovery = str(payload["attempt"]), str(payload.get("recovery_attempt", 0))
+            observed.append(copy.deepcopy(state))
+            self.assertEqual(state["1"], {"mergeability": 0, "recovery": min(turn + 1, 3)})
+            self.assertEqual(state["2"], {"mergeability": min(turn + 1, 3), "recovery": max(turn - 2, 0)})
+            self.assertEqual(scope, [1, 2] if turn < 3 else [2])
+        self.assertEqual(observed[3]["2"], {"mergeability": 3, "recovery": 1})
+        self.assertEqual(observed[-1]["2"]["recovery"], 3)
+
+    def test_distinct_per_pr_budgets_preserve_exhausted_entries_outside_next_scope(self):
+        api = FakeGitHub();api.ci = True
+        original_call, original_pages = api.call, api.pages
+        def mixed(path, method="GET", payload=None):
+            if path == "graphql" and method == "POST" and payload["query"].startswith("query"):
+                info = copy.deepcopy(api.info)
+                if payload["variables"]["number"] == 1:
+                    info["mergeStateStatus"] = "UNKNOWN"
+                return {"data": {"repository": {"pullRequest": info}}}
+            if path.endswith("/pulls/2/merge"):
+                return self.incomplete_http_response(path, method, payload)
+            if path == "repos/owner/repo/pulls/2":
+                return {**copy.deepcopy(api.pr), "number": 2}
+            return original_call(path, method, payload)
+        def files(path, **kwargs):
+            if path.endswith("/pulls/2/files"):
+                return [{"filename": "README.md"}]
+            return original_pages(path, **kwargs)
+        state = {"1": {"mergeability": 2, "recovery": 3},
+                 "2": {"mergeability": 3, "recovery": 1}}
+        for turn, wanted_scope in [(0, [1, 2]), (1, [2])]:
+            api.calls.clear();api.retry_states.clear()
+            with tempfile.NamedTemporaryFile(mode="w+") as f:
+                json.dump({"repository": {"default_branch": "main"}, "inputs": {
+                    "auto_merge_retry_state": json.dumps(state), "auto_merge_retry": "3",
+                    "auto_merge_recovery_retry": "3"}}, f);f.flush()
+                with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name,
+                                             "NIMO_GATE_BOOTSTRAP_NUMBERS": "[]"}), \
+                     patch("auto_merge.MergeGitHub", return_value=api), \
+                     patch.object(api, "call", side_effect=mixed), \
+                     patch.object(api, "pages", side_effect=files), patch("auto_merge.time.sleep"):
+                    with self.assertRaises(RuntimeError):
+                        run()
+            dispatches = [c for c in api.calls if c[0] == "retry"]
+            self.assertEqual(len(dispatches), 1)
+            self.assertEqual(dispatches[0][2]["numbers"], wanted_scope)
+            state = api.retry_states[-1]
+            self.assertEqual(state["1"], {"mergeability": 3, "recovery": 3})
+            self.assertEqual(state["2"], {"mergeability": 3, "recovery": turn + 2})
+
+    def test_malformed_retry_state_is_rejected_before_any_github_operation(self):
+        malformed = ["[]", "null", "{", json.dumps({"0": {"mergeability": 0, "recovery": 0}}),
+            json.dumps({"01": {"mergeability": 0, "recovery": 0}}),
+            json.dumps({"1": {"mergeability": True, "recovery": 0}}),
+            json.dumps({"1": {"mergeability": -1, "recovery": 0}}),
+            json.dumps({"1": {"mergeability": 0, "recovery": 4}}),
+            json.dumps({"1": {"mergeability": 0, "recovery": "1"}}),
+            json.dumps({"1": {"mergeability": 0}}),
+            json.dumps({"1": {"mergeability": 0, "recovery": 0, "extra": 0}}),
+            '{"1":{"mergeability":0,"recovery":0},"1":{"mergeability":0,"recovery":0}}',
+            '{"1":{"mergeability":0,"mergeability":1,"recovery":0}}']
+        for raw in malformed:
+            with self.subTest(raw=raw), tempfile.NamedTemporaryFile(mode="w+") as f:
+                json.dump({"repository": {"default_branch": "main"}, "inputs": {
+                    "auto_merge_retry_state": raw}}, f);f.flush()
+                with patch.dict(os.environ, {"GITHUB_EVENT_PATH": f.name}), \
+                     patch("auto_merge.MergeGitHub") as api:
+                    with self.assertRaises(RuntimeError):
+                        run()
+                    api.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
