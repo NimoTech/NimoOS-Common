@@ -162,6 +162,35 @@ class GatePolicyTests(unittest.TestCase):
         r["user"]["login"] = "claude-impostor[bot]"
         self.assertEqual(self.state(rs=[r]), "pending")
 
+    def receipt(self, cs, verdict="Didn't find any major issues. Keep them coming!"):
+        cs[1]["body"] = ("<!-- codex-review-receipt:v1 -->\n\nCodex Review: " + verdict + "\n\n**Reviewed commit:** "
+                         + TICK + SHA[:10] + TICK + "\n\n<details> <summary>About Codex in GitHub</summary></details>")
+        return cs
+
+    def test_codex_receipt_clear_result_passes(self):
+        self.assertEqual(self.state(cs=self.receipt(clean())), "success")
+
+    def test_codex_receipt_from_a_member_is_ignored(self):
+        cs = self.receipt(clean())
+        cs[1]["user"] = user("developer")
+        self.assertEqual(self.state(cs=cs), "pending")
+
+    def test_codex_receipt_before_a_new_request_cannot_pass(self):
+        cs = self.receipt(clean()) + [{"id": 3, "user": user("developer"), "author_association": "MEMBER",
+                                       "body": "@codex review", "created_at": "2026-10-08T10:01:00Z"}]
+        self.assertEqual(self.state(cs=cs), "pending")
+
+    def test_codex_receipt_for_another_commit_cannot_pass(self):
+        cs = self.receipt(clean())
+        cs[1]["verified_commit_id"] = "1" * 40
+        self.assertEqual(self.state(cs=cs), "pending")
+
+    def test_codex_receipt_does_not_hide_a_current_p1_thread(self):
+        self.assertEqual(self.state(cs=self.receipt(clean()), ts=[thread(1)]), "failure")
+
+    def test_codex_receipt_with_unclassified_suggestions_fails_closed(self):
+        self.assertEqual(self.state(cs=self.receipt(clean(), "Here are some suggestions.")), "failure")
+
     def test_new_review_request_invalidates_old_native_verdict(self):
         cs = clean() + [{"id": 3, "user": user("developer"), "author_association": "MEMBER", "body": "@codex review",
                         "created_at": "2026-10-08T10:01:00Z"}]

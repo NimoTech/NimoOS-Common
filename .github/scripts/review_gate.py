@@ -19,6 +19,7 @@ BOTS = {CODEX, CLAUDE}
 BRIDGE = "github-actions[bot]"
 BRIDGE_ID = 41898282
 BRIDGE_MARKER = "<!-- nimo-review-gate-approval -->"
+CODEX_RECEIPT_MARKER = "<!-- codex-review-receipt:v1 -->"
 TICK = chr(96)
 
 
@@ -62,6 +63,14 @@ def bridge_review(review):
 
 def public_body(body):
     return (body or "").split("<details", 1)[0]
+
+
+def verdict_text(body):
+    """Public text of a Codex verdict, without the marker its receipt comments start with."""
+    text = public_body(body)
+    if text.startswith(CODEX_RECEIPT_MARKER):
+        text = text[len(CODEX_RECEIPT_MARKER):].lstrip()
+    return text
 
 
 def matches(short, sha):
@@ -172,7 +181,7 @@ def decision(pr, reviews, comments, threads, reactions=()):
 
     candidates = []
     for item in native_comments + native_reviews:
-        body = public_body(item.get("body"))
+        body = verdict_text(item.get("body"))
         if body.startswith("Codex Review:") or body.lstrip().startswith("### 💡 Codex Review"):
             candidates.append((stamp(item.get("submitted_at") or item.get("created_at")), item["id"], body))
     if not candidates:
