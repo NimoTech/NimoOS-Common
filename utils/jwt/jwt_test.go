@@ -59,12 +59,24 @@ func TestJwtFlow(t *testing.T) {
 	assert.Equal(t, username, claims.Username)
 	assert.Equal(t, id, claims.ID)
 
-	// Validate the refresh token
+	// A refresh token must not pass as an access token
 	valid, claims, err = jwt.Validate(refreshToken, func() (*ecdsa.PublicKey, error) { return consumedPublicKey, nil })
+	assert.Error(t, err)
+	assert.False(t, valid)
+	assert.Nil(t, claims)
+
+	// ValidateRefresh accepts the refresh token...
+	valid, claims, err = jwt.ValidateRefresh(refreshToken, func() (*ecdsa.PublicKey, error) { return consumedPublicKey, nil })
 	require.NoError(t, err)
 	assert.True(t, valid)
 	assert.Equal(t, username, claims.Username)
 	assert.Equal(t, id, claims.ID)
+
+	// ...and rejects the access token
+	valid, claims, err = jwt.ValidateRefresh(accessToken, func() (*ecdsa.PublicKey, error) { return consumedPublicKey, nil })
+	assert.Error(t, err)
+	assert.False(t, valid)
+	assert.Nil(t, claims)
 }
 
 func TestInvalidToken(t *testing.T) {
@@ -214,5 +226,39 @@ func TestJWTMiddlewareAcceptsBothAuthorizationForms(t *testing.T) {
 			require.NoError(t, json.Unmarshal(respRecorder.Body.Bytes(), &result))
 			assert.Equal(t, common_err.SUCCESS, result.Success)
 		})
+	}
+}
+
+func TestJWTMiddlewareRejectsRefreshToken(t *testing.T) {
+	privateKey, publicKey, err := jwt.GenerateKeyPair()
+	require.NoError(t, err)
+	refreshToken, err := jwt.GetRefreshToken("testuser", privateKey, 1)
+	require.NoError(t, err)
+	accessToken, err := jwt.GetAccessToken("testuser", privateKey, 1)
+	require.NoError(t, err)
+
+	e := echo.New()
+	e.Use(jwt.JWT(func() (*ecdsa.PublicKey, error) { return publicKey, nil }))
+	e.GET("/x", func(c echo.Context) error { return c.String(http.StatusOK, "ok") })
+
+	for _, tc := range []struct {
+		name  string
+		token string
+		want  int
+	}{
+		{"refresh", refreshToken, http.StatusUnauthorized},
+		{"access", accessToken, http.StatusOK},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req.RemoteAddr = "192.0.2.10:4321"
+		req.Header.Set(echo.HeaderAuthorization, tc.token)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		assert.Equal(t, tc.want, rec.Code, tc.name)
+		if tc.want == http.StatusUnauthorized {
+			var res model.Result
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &res))
+			assert.Equal(t, common_err.ERROR_AUTH_TOKEN, res.Success)
+		}
 	}
 }

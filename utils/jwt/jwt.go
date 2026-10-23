@@ -50,24 +50,39 @@ func ParseToken(signedToken string, publicKeyFunc func() (*ecdsa.PublicKey, erro
 	return nil, errors.New("invalid token")
 }
 
+const (
+	accessIssuer  = "nimoos"
+	refreshIssuer = "refresh"
+)
+
 // get AccessToken
 func GetAccessToken(username string, privateKey *ecdsa.PrivateKey, id int) (string, error) {
-	return GenerateToken(username, privateKey, id, "nimoos", 3*time.Hour)
+	return GenerateToken(username, privateKey, id, accessIssuer, 3*time.Hour)
 }
 
 func GetRefreshToken(username string, private *ecdsa.PrivateKey, id int) (string, error) {
-	return GenerateToken(username, private, id, "refresh", 7*24*time.Hour)
+	return GenerateToken(username, private, id, refreshIssuer, 7*24*time.Hour)
 }
 
+// Validate accepts only access tokens. A refresh token is signed by the same
+// key and lives 7 days; letting it through here would turn every refresh
+// token into a week-long access token.
 func Validate(token string, publicKeyFunc func() (*ecdsa.PublicKey, error)) (bool, *Claims, error) {
+	return validateIssuer(token, publicKeyFunc, accessIssuer)
+}
+
+// ValidateRefresh accepts only refresh tokens.
+func ValidateRefresh(token string, publicKeyFunc func() (*ecdsa.PublicKey, error)) (bool, *Claims, error) {
+	return validateIssuer(token, publicKeyFunc, refreshIssuer)
+}
+
+func validateIssuer(token string, publicKeyFunc func() (*ecdsa.PublicKey, error), issuer string) (bool, *Claims, error) {
 	claims, err := ParseToken(token, publicKeyFunc)
 	if err != nil {
 		return false, nil, err
 	}
-
-	if claims != nil {
-		return true, claims, nil
+	if claims.Issuer != issuer {
+		return false, nil, fmt.Errorf("token issuer %q, want %q", claims.Issuer, issuer)
 	}
-
-	return false, nil, errors.New("invalid token")
+	return true, claims, nil
 }
