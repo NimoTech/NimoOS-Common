@@ -205,8 +205,8 @@ def decision(pr, reviews, comments, threads, reactions=()):
     # A later explicit clean review may clarify it; known P0/P1 findings above
     # still require a new commit or named-maintainer acceptance.
     if any(r.get("body", "").strip() and priority(r.get("body")) is None
-           and not public_body(r.get("body")).startswith("Codex Review:")
-           and not public_body(r.get("body")).lstrip().startswith("### 💡 Codex Review")
+           and not verdict_text(r.get("body")).startswith("Codex Review:")
+           and not verdict_text(r.get("body")).lstrip().startswith("### 💡 Codex Review")
            and stamp(r.get("submitted_at")) >= result_at for r in native_reviews):
         return "pending", "Current Codex review text is unrecognized; awaiting clarification or maintainer approval."
     if result_at <= last_request(comments, CODEX):

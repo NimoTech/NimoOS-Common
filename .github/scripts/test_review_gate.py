@@ -286,6 +286,22 @@ class GateRegressionTests(unittest.TestCase):
         t["body"] = "An unclassified finding"
         self.assertEqual(self.state(rs=[r], cs=clean()[:1], ts=[t]), "failure")
 
+    def receipt_review(self, text="### 💡 Codex Review\n\nHere are some automated review suggestions.", id=1):
+        r = review(CODEX, "COMMENTED", id=id)
+        r["body"] = ("<!-- codex-review-receipt:v1 -->\n\n\n" + text + "\n\n**Reviewed commit:** " + TICK + SHA[:10]
+                     + TICK + "\n\n<details> <summary>About Codex in GitHub</summary></details>")
+        return r
+
+    def test_formal_codex_receipt_review_with_only_p2_findings_passes(self):
+        self.assertEqual(self.state(rs=[self.receipt_review()], cs=clean()[:1], ts=[thread(level=2)]), "success")
+
+    def test_formal_codex_receipt_review_with_unknown_text_stays_pending(self):
+        rs = [self.receipt_review(), self.receipt_review("Something Codex never said before.", id=2)]
+        self.assertEqual(self.state(rs=rs, cs=clean()[:1], ts=[thread(level=2)]), "pending")
+
+    def test_formal_codex_receipt_review_does_not_hide_a_current_p1_thread(self):
+        self.assertEqual(self.state(rs=[self.receipt_review()], cs=clean()[:1], ts=[thread(level=1)]), "failure")
+
 
 
 class GraphQLIdentityTests(unittest.TestCase):
