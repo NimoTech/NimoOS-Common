@@ -30,11 +30,40 @@ type ManagementService interface {
 }
 
 type managementService struct {
-	address string
+	address     string
+	addressFile string // set: resolve the address from this file on every call
+}
+
+// NewLazyManagementService returns a ManagementService that reads the Gateway's
+// address from <runtimePath>/management.url on every call. Unlike
+// NewManagementService it never waits, pings or fails at construction, so a
+// Gateway that is down or late cannot stop the caller from starting; a call made
+// while the Gateway is unreachable returns an error instead.
+func NewLazyManagementService(runtimePath string) ManagementService {
+	return &managementService{addressFile: filepath.Join(runtimePath, ManagementURLFilename)}
+}
+
+func (m *managementService) baseURL() (string, error) {
+	address := m.address
+	if m.addressFile != "" {
+		a, err := getAddress(m.addressFile)
+		if err != nil {
+			return "", fmt.Errorf("gateway address: %w", err)
+		}
+		address = strings.TrimSpace(a)
+		if address == "" {
+			return "", errors.New("gateway address file is empty: " + m.addressFile)
+		}
+	}
+	return strings.TrimSuffix(address, "/"), nil
 }
 
 func (m *managementService) CreateRoute(route *model.Route) error {
-	url := strings.TrimSuffix(m.address, "/") + "/" + strings.TrimPrefix(APIGatewayRoutes, "/")
+	base, err := m.baseURL()
+	if err != nil {
+		return err
+	}
+	url := base + "/" + strings.TrimPrefix(APIGatewayRoutes, "/")
 	body, err := json.Marshal(route)
 	if err != nil {
 		return err
@@ -54,7 +83,11 @@ func (m *managementService) CreateRoute(route *model.Route) error {
 }
 
 func (m *managementService) ChangePort(request *model.ChangePortRequest) error {
-	url := strings.TrimSuffix(m.address, "/") + "/" + strings.TrimPrefix(APIGatewayPort, "/")
+	base, err := m.baseURL()
+	if err != nil {
+		return err
+	}
+	url := base + "/" + strings.TrimPrefix(APIGatewayPort, "/")
 	body, err := json.Marshal(request)
 	if err != nil {
 		return err
@@ -73,7 +106,11 @@ func (m *managementService) ChangePort(request *model.ChangePortRequest) error {
 }
 
 func (m *managementService) GetPort() (error, string) {
-	url := strings.TrimSuffix(m.address, "/") + "/" + strings.TrimPrefix(APIGatewayPort, "/")
+	base, err := m.baseURL()
+	if err != nil {
+		return err, ""
+	}
+	url := base + "/" + strings.TrimPrefix(APIGatewayPort, "/")
 
 	response, err := http2.Get(url, 30*time.Second)
 	if err != nil {

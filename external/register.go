@@ -61,10 +61,19 @@ const backgroundReminderEvery = 10 * time.Minute
 // a new port, is picked up. Routes already accepted are not submitted again.
 func RegisterRoutes(ctx context.Context, runtimePath string, routes []*model.Route, opts RegisterOptions) error {
 	opts = opts.withDefaults()
+	// Copy the values: the background goroutine keeps reading them after we
+	// return, and the caller may reuse or change its Route structs.
+	own := make([]*model.Route, 0, len(routes))
+	for _, route := range routes {
+		if route != nil {
+			c := *route
+			own = append(own, &c)
+		}
+	}
 	r := &registrar{
 		addressFile: filepath.Join(runtimePath, ManagementURLFilename),
-		all:         append([]*model.Route(nil), routes...),
-		pending:     append([]*model.Route(nil), routes...),
+		all:         own,
+		pending:     append([]*model.Route(nil), own...),
 		opts:        opts,
 	}
 
@@ -92,8 +101,11 @@ func RegisterRoutes(ctx context.Context, runtimePath string, routes []*model.Rou
 		if time.Now().Add(backoff).After(deadline) {
 			break
 		}
-		if !sleep(ctx, jitter(backoff)) {
-			return ctx.Err()
+		if !sleep(syncCtx, jitter(backoff)) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			break // the synchronous window ended mid-wait
 		}
 		backoff = next(backoff, opts.MaxBackoff)
 	}

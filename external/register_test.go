@@ -308,3 +308,64 @@ func TestRegisterRoutesSyncPhaseRespectsWaitWithAHangingGateway(t *testing.T) {
 		t.Fatalf("sync phase took %v, want about opts.Wait (100ms)", d)
 	}
 }
+
+func TestRegisterRoutesCopiesRoutes(t *testing.T) {
+	// The caller changes its Route after RegisterRoutes returned; the background
+	// retry must still register what was passed in.
+	g := newFakeGateway(t, func(string) int { return http.StatusServiceUnavailable })
+	dir := t.TempDir()
+	writeAddress(t, dir, g.srv.URL)
+
+	var registered atomic.Bool
+	opts := fast(20 * time.Millisecond)
+	opts.OnRegistered = func() { registered.Store(true) }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rs := routes("/v1/original")
+	_ = RegisterRoutes(ctx, dir, rs, opts)
+	rs[0].Path = "/v1/changed"
+
+	g.setStatus(func(string) int { return http.StatusCreated })
+	waitFor(t, registered.Load)
+	if got := g.acceptedPaths(); len(got) != 1 || got[0] != "/v1/original" {
+		t.Fatalf("accepted %v, want [/v1/original]", got)
+	}
+}
+
+func TestRegisterRoutesJitteredWaitStaysWithinWait(t *testing.T) {
+	// Fast failures with a backoff close to Wait: a positive jitter must not
+	// carry the synchronous phase past Wait.
+	g := newFakeGateway(t, func(string) int { return http.StatusServiceUnavailable })
+	dir := t.TempDir()
+	writeAddress(t, dir, g.srv.URL)
+
+	opts := fast(120 * time.Millisecond)
+	opts.InitialBackoff = 100 * time.Millisecond
+	opts.MaxBackoff = 100 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for i := 0; i < 20; i++ { // jitter is random: repeat
+		start := time.Now()
+		_ = RegisterRoutes(ctx, dir, routes("/v1/a"), opts)
+		if d := time.Since(start); d > 160*time.Millisecond {
+			t.Fatalf("sync phase took %v with Wait=120ms", d)
+		}
+	}
+}
+
+func TestLazyManagementServiceNeverFailsAtConstruction(t *testing.T) {
+	dir := t.TempDir()
+	m := NewLazyManagementService(dir) // no management.url yet: must not block or fail
+	if err := m.CreateRoute(&model.Route{Path: "/v1/a", Target: "http://127.0.0.1:1"}); err == nil {
+		t.Fatal("CreateRoute succeeded without a Gateway address")
+	}
+
+	g := newFakeGateway(t, func(string) int { return http.StatusCreated })
+	writeAddress(t, dir, g.srv.URL)
+	if err := m.CreateRoute(&model.Route{Path: "/v1/a", Target: "http://127.0.0.1:1"}); err != nil {
+		t.Fatalf("CreateRoute after the address appeared: %v", err)
+	}
+	if got := g.acceptedPaths(); len(got) != 1 {
+		t.Fatalf("accepted %v", got)
+	}
+}
